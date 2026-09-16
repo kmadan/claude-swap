@@ -57,6 +57,13 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Account-wide windows the decision reads: "5h,7d" (default, both) or
+    # "5h" (ignore the weekly window). With "5h", a 7-day figure short of
+    # exhaustion can no longer evict an account whose 5-hour window still has
+    # room, nor rule one out as a landing target. A window at
+    # ``oauth.WINDOW_EXHAUSTED_PCT`` is still honoured either way: at 100% the
+    # weekly limit blocks requests exactly like the 5-hour one.
+    windows: str = "5h,7d"
 
 
 @dataclass(frozen=True)
@@ -136,6 +143,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
         ),
         SettingSpec(
+            "autoswitch", "windows", "windows", "choice",
+            choices=("5h,7d", "5h"),
+            help="Account-wide windows the switch decision reads",
+        ),
+        SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
         ),
@@ -165,6 +177,22 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
         if name and name.lower() not in seen:
             seen[name.lower()] = name
     return tuple(seen.values())
+
+
+def parse_window_labels(value: str | None) -> frozenset[str]:
+    """Split ``autoswitch.windows`` into decision window labels.
+
+    Mirrors :func:`parse_model_names`: comma-separated, trimmed, deduped. An
+    empty or unrecognised value yields both windows, so a bad hand edit
+    degrades to the default behaviour rather than silently narrowing the
+    decision.
+    """
+    known = {"5h", "7d"}
+    if not value:
+        return frozenset(known)
+    labels = {part.strip().lower() for part in value.split(",")}
+    selected = labels & known
+    return frozenset(selected) if selected else frozenset(known)
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:

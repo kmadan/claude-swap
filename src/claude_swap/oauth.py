@@ -535,12 +535,58 @@ def build_usage_result(data: dict) -> dict | None:
     return result if result else None
 
 
+# A window at or above this utilization blocks requests outright. Such a
+# window is never dropped by ``autoswitch.windows``: ignoring an exhausted
+# weekly limit would let the engine rank an account that cannot serve a single
+# call as a viable landing target.
+WINDOW_EXHAUSTED_PCT = 100.0
+
+# (settings.json mtime_ns, resolved labels). ``relevant_windows`` runs per
+# account per tick, so the resolved value is memoized; keying on the file's
+# mtime lets a long-running ``cswap auto`` pick up a ``cswap config set``
+# without a restart.
+_DECISION_WINDOWS_MEMO: tuple[int, frozenset[str]] | None = None
+
+_ALL_WINDOWS = frozenset({"5h", "7d"})
+
+
+def decision_windows() -> frozenset[str]:
+    """Account-wide window labels the decision reads (``autoswitch.windows``).
+
+    Imports lazily because ``claude_swap.paths`` reaches this module back
+    through ``models`` and ``usage_store``. Any failure to resolve the setting
+    yields both windows, so an unreadable or absent settings file keeps the
+    documented default rather than silently narrowing every decision.
+    """
+    global _DECISION_WINDOWS_MEMO
+    try:
+        from claude_swap import paths, settings as settings_module
+
+        root = paths.get_backup_root()
+        stamp = settings_module.settings_path(root).stat().st_mtime_ns
+        memo = _DECISION_WINDOWS_MEMO
+        if memo is not None and memo[0] == stamp:
+            return memo[1]
+        labels = settings_module.parse_window_labels(
+            settings_module.load_settings(root).windows
+        )
+        _DECISION_WINDOWS_MEMO = (stamp, labels)
+        return labels
+    except Exception:  # unreadable settings, missing file, import trouble
+        return _ALL_WINDOWS
+
+
 def relevant_windows(
     usage: dict | None, models: Sequence[str] = ()
 ) -> list[tuple[str, float, str | None]]:
     """Every ``(label, pct, resets_at)`` window that gates this account.
 
-    Always the 5-hour ("5h") and 7-day ("7d") windows. When ``models`` is
+    The 5-hour ("5h") and 7-day ("7d") windows, subject to
+    ``autoswitch.windows``: setting it to "5h" drops a 7-day window that is
+    still below :data:`WINDOW_EXHAUSTED_PCT`, so a weekly figure short of
+    exhaustion stops evicting accounts and stops ruling them out as targets.
+    An exhausted window is always included whichever way that is set. When
+    ``models`` is
     non-empty, each named per-model weekly ``scoped`` window is included too
     (matched case-insensitively on display name, e.g. "Fable"; the sentinel
     ``all`` matches every scoped window the account reports). The single
@@ -553,10 +599,15 @@ def relevant_windows(
     if not isinstance(usage, dict):
         return []
     windows: list[tuple[str, float, str | None]] = []
+    selected = decision_windows()
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
-        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
-            windows.append((label, float(window["pct"]), window.get("resets_at")))
+        if not (isinstance(window, dict) and isinstance(window.get("pct"), (int, float))):
+            continue
+        pct = float(window["pct"])
+        if label not in selected and pct < WINDOW_EXHAUSTED_PCT:
+            continue
+        windows.append((label, pct, window.get("resets_at")))
     if models:
         wanted = {m.lower() for m in models}
         match_all = "all" in wanted
