@@ -64,6 +64,13 @@ class AutoSwitchSettings:
     # ``oauth.WINDOW_EXHAUSTED_PCT`` is still honoured either way: at 100% the
     # weekly limit blocks requests exactly like the 5-hour one.
     windows: str = "5h,7d"
+    # Per-window switch limits, e.g. "5h:90,7d:97": a window named here
+    # is judged against its own percentage instead of ``threshold``, so a
+    # weekly quota can be allowed to run closer to its ceiling than a
+    # 5-hour one. Empty (the default) leaves every window on
+    # ``threshold``. A window at ``oauth.WINDOW_EXHAUSTED_PCT`` blocks
+    # whatever is configured here.
+    window_thresholds: str = ""
 
 
 @dataclass(frozen=True)
@@ -148,6 +155,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Account-wide windows the switch decision reads",
         ),
         SettingSpec(
+            "autoswitch", "windowThresholds", "window_thresholds", "string",
+            help="Per-window switch limits, e.g. 5h:90,7d:97 (blank = threshold)",
+        ),
+        SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
         ),
@@ -193,6 +204,30 @@ def parse_window_labels(value: str | None) -> frozenset[str]:
     labels = {part.strip().lower() for part in value.split(",")}
     selected = labels & known
     return frozenset(selected) if selected else frozenset(known)
+
+
+def parse_window_thresholds(value: str | None) -> dict[str, float]:
+    """Split ``autoswitch.windowThresholds`` into ``{label: pct}``.
+
+    Accepts "5h:90,7d:97" and per-model names ("Fable:95"); labels are
+    lowercased so lookups match however the window was spelled. A pair
+    that does not parse, or names a percentage outside 1-100, is dropped
+    rather than raising: a bad hand edit costs that one window its custom
+    limit and leaves it on ``threshold``, which is the documented default.
+    """
+    limits: dict[str, float] = {}
+    if not value:
+        return limits
+    for part in value.split(","):
+        label, _, raw = part.partition(":")
+        label = label.strip().lower()
+        try:
+            pct = float(raw.strip())
+        except ValueError:
+            continue
+        if label and 1.0 <= pct <= 100.0:
+            limits[label] = pct
+    return limits
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:

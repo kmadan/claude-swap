@@ -576,6 +576,74 @@ def decision_windows() -> frozenset[str]:
         return _ALL_WINDOWS
 
 
+# (settings.json mtime_ns, per-window limits, global threshold). Same
+# memo discipline as ``decision_windows``: resolved per account per tick,
+# and keyed on the settings file so a ``cswap config set`` reaches a
+# long-running ``cswap auto`` without a restart.
+_WINDOW_THRESHOLD_MEMO: tuple[int, dict[str, float], float] | None = None
+
+# AutoSwitchSettings.threshold's own default, used when settings cannot
+# be read at all.
+_DEFAULT_THRESHOLD = 90.0
+
+
+def window_thresholds() -> tuple[dict[str, float], float]:
+    """``({label: pct}, threshold)`` from ``autoswitch.windowThresholds``.
+
+    Imported lazily and failure-tolerant for the same reason as
+    :func:`decision_windows`: an unreadable settings file yields no
+    per-window limits, which is the documented default rather than a
+    silently altered decision.
+    """
+    global _WINDOW_THRESHOLD_MEMO
+    try:
+        from claude_swap import paths, settings as settings_module
+
+        root = paths.get_backup_root()
+        stamp = settings_module.settings_path(root).stat().st_mtime_ns
+        memo = _WINDOW_THRESHOLD_MEMO
+        if memo is not None and memo[0] == stamp:
+            return memo[1], memo[2]
+        loaded = settings_module.load_settings(root)
+        limits = settings_module.parse_window_thresholds(
+            getattr(loaded, "window_thresholds", "")
+        )
+        threshold = float(loaded.threshold)
+        _WINDOW_THRESHOLD_MEMO = (stamp, limits, threshold)
+        return limits, threshold
+    except Exception:  # unreadable settings, missing file, import trouble
+        return {}, _DEFAULT_THRESHOLD
+
+
+def effective_pct(
+    label: str, pct: float, limits: dict[str, float], threshold: float
+) -> float:
+    """``pct`` restated so one global comparison enforces a per-window limit.
+
+    Every consumer of :func:`relevant_windows` compares the binding window
+    against ``autoswitch.threshold`` - the engine, the ranking, the poll
+    scheduler and the manual ``switch --best`` selection alike. Rather than
+    teach each of those sites a second number, a window carrying its own
+    limit is reported on the global scale: at or over its limit it reports
+    at least ``threshold`` (so it blocks), and below its limit it reports
+    below ``threshold`` (so it cannot). Ranking therefore stays consistent
+    with the verdict, which is the property the module relies on.
+
+    The restatement is exact outside the band between the two numbers: a 7d
+    window limited at 97 reports 70 as 70 and 98 as 98, and only a value
+    inside [threshold, 97) is compressed to just under the threshold, which
+    is the interval where the true figure and the verdict disagree anyway.
+    An exhausted window is never restated: 100 means no request can be
+    served, whatever limit was configured.
+    """
+    limit = limits.get(label.lower())
+    if limit is None or pct >= WINDOW_EXHAUSTED_PCT:
+        return pct
+    if pct >= limit:
+        return max(pct, threshold)
+    return min(pct, threshold - 0.01)
+
+
 def relevant_windows(
     usage: dict | None, models: Sequence[str] = ()
 ) -> list[tuple[str, float, str | None]]:
@@ -585,7 +653,9 @@ def relevant_windows(
     ``autoswitch.windows``: setting it to "5h" drops a 7-day window that is
     still below :data:`WINDOW_EXHAUSTED_PCT`, so a weekly figure short of
     exhaustion stops evicting accounts and stops ruling them out as targets.
-    An exhausted window is always included whichever way that is set. When
+    An exhausted window is always included whichever way that is set.
+    Percentages are restated by :func:`effective_pct` when
+    ``autoswitch.windowThresholds`` gives a window its own limit. When
     ``models`` is
     non-empty, each named per-model weekly ``scoped`` window is included too
     (matched case-insensitively on display name, e.g. "Fable"; the sentinel
@@ -600,6 +670,7 @@ def relevant_windows(
         return []
     windows: list[tuple[str, float, str | None]] = []
     selected = decision_windows()
+    limits, threshold = window_thresholds()
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
         if not (isinstance(window, dict) and isinstance(window.get("pct"), (int, float))):
@@ -607,7 +678,13 @@ def relevant_windows(
         pct = float(window["pct"])
         if label not in selected and pct < WINDOW_EXHAUSTED_PCT:
             continue
-        windows.append((label, pct, window.get("resets_at")))
+        windows.append(
+            (
+                label,
+                effective_pct(label, pct, limits, threshold),
+                window.get("resets_at"),
+            )
+        )
     if models:
         wanted = {m.lower() for m in models}
         match_all = "all" in wanted
@@ -620,7 +697,15 @@ def relevant_windows(
                     and isinstance(s.get("name"), str)
                     and (match_all or s["name"].lower() in wanted)
                 ):
-                    windows.append((s["name"], float(s["pct"]), s.get("resets_at")))
+                    windows.append(
+                        (
+                            s["name"],
+                            effective_pct(
+                                s["name"], float(s["pct"]), limits, threshold
+                            ),
+                            s.get("resets_at"),
+                        )
+                    )
     return windows
 
 
