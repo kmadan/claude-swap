@@ -114,7 +114,7 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 */5 * * * * cswap auto --once --json >> ~/.cswap-auto.log 2>&1
 ```
 
-Defaults like the threshold and cooldown are configurable with `cswap config set autoswitch.threshold 80` — flags override them (see [Configuration](#configuration)).
+Defaults like the threshold and cooldown are configurable with `cswap config set autoswitch.threshold 80` — flags override them (see [Configuration](#configuration)). A running `cswap auto` re-reads settings.json on every tick, so a `cswap config set` takes effect on the next poll rather than at the next restart; flags passed to that process still win over the file for its lifetime.
 
 </details>
 

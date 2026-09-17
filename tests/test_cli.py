@@ -1059,11 +1059,12 @@ class TestAutoCommand:
         tick_outcome = None  # set per test (TickOutcome)
 
         def __init__(self, switcher, settings, on_event, *, dry_run=False,
-                     state_path=None, clock=None):
+                     state_path=None, clock=None, settings_provider=None):
             self.switcher = switcher
             self.settings = settings
             self.on_event = on_event
             self.dry_run = dry_run
+            self.settings_provider = settings_provider
             type(self).instances.append(self)
 
         def tick(self):
@@ -1089,6 +1090,21 @@ class TestAutoCommand:
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         return excinfo.value.code
+
+    def test_engine_is_given_a_live_settings_provider(self, temp_home):
+        """A frozen snapshot would mean every knob needs a restart.
+
+        The provider is what lets `cswap config set` reach a running loop, so
+        the wiring is pinned here rather than left to the engine's own tests.
+        """
+        from claude_swap.autoswitch import TickOutcome
+        from claude_swap.settings import AutoSwitchSettings
+
+        self.FakeEngine.tick_outcome = TickOutcome.NO_ACTION
+        self._run(["--once"], temp_home)
+        provider = self.FakeEngine.instances[0].settings_provider
+        assert callable(provider)
+        assert isinstance(provider(), AutoSwitchSettings)
 
     def test_once_exit_code_switched(self, temp_home):
         from claude_swap.autoswitch import TickOutcome
@@ -1767,3 +1783,4 @@ def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
     home = Path(_subprocess_env()["HOME"])
     assert home.is_dir(), f"the isolated HOME is not a real directory: {home}"
     assert home.is_relative_to(tmp_path_factory.getbasetemp()), f"{home} escapes basetemp"
+

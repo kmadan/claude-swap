@@ -686,7 +686,7 @@ Defaults live in settings.json in the backup root; flags override them.
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.printer import accent, yellowed
-    from claude_swap.settings import load_settings, merged_with_cli
+    from claude_swap.settings import live_settings
 
     def jsonl_emit(event: AutoSwitchEvent) -> None:
         print(json.dumps(event.to_json()), flush=True)
@@ -709,12 +709,17 @@ Defaults live in settings.json in the backup root; flags override them.
                 error("Error: Do not run this script as root (unless running in a container)")
                 sys.exit(1)
 
-        settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        # Asked again on every tick, so `cswap config set` reaches this loop
+        # without a restart. CLI flags are re-applied over each reload, so a
+        # flag still beats the file for the life of the process.
+        provider = live_settings(switcher.backup_dir, args)
+        settings = provider()
         engine = AutoSwitchEngine(
             switcher,
             settings,
             jsonl_emit if args.json else human_emit,
             dry_run=args.dry_run,
+            settings_provider=provider,
         )
 
         if args.once:

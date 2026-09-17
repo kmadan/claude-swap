@@ -540,6 +540,43 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     return _clamped(dataclasses.replace(settings, **overrides))
 
 
+def live_settings(backup_root: Path, args=None):
+    """A callable returning the current settings, re-read when the file changes.
+
+    The auto engine captures its settings once, so every knob except the ones
+    resolved per tick needs a restart to take effect. Passing this as
+    ``settings_provider`` removes that distinction: the engine asks on each
+    tick and gets whatever settings.json now says, with any CLI overrides laid
+    back over the top so a flag still beats the file.
+
+    Keyed on the file's mtime, so an unchanged file costs one stat rather than
+    a parse, and a value the loader warns about is not re-warned every tick.
+    Any failure to read returns the last good settings: a half-written file
+    must not change a running policy.
+    """
+    cache: dict = {"stamp": None, "value": None}
+
+    def provider() -> AutoSwitchSettings:
+        try:
+            stamp = settings_path(backup_root).stat().st_mtime_ns
+        except OSError:
+            stamp = None
+        if cache["value"] is not None and stamp == cache["stamp"]:
+            return cache["value"]
+        try:
+            value = load_settings(backup_root)
+            if args is not None:
+                value = merged_with_cli(value, args)
+        except Exception:
+            if cache["value"] is not None:
+                return cache["value"]
+            value = AutoSwitchSettings()
+        cache["stamp"], cache["value"] = stamp, value
+        return value
+
+    return provider
+
+
 def atomic_write_json(path: Path, data: dict) -> None:
     """Atomically write JSON with the backup dir's 0600/0700 modes.
 

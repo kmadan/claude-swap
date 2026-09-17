@@ -257,8 +257,9 @@ class TestConfigMisc:
 
         class FakeEngine:
             def __init__(self, switcher, settings, on_event, *, dry_run=False,
-                         state_path=None, clock=None):
+                         state_path=None, clock=None, settings_provider=None):
                 captured["settings"] = settings
+                captured["provider"] = settings_provider
 
             def tick(self):
                 from claude_swap.autoswitch import TickOutcome

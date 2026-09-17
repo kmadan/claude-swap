@@ -7160,3 +7160,78 @@ class TestAccountWeights:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+
+class TestLiveSettings:
+    """A settings_provider makes every knob take effect on the next tick."""
+
+    def _harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="runway", **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    @staticmethod
+    def _fleet(h: EngineHarness) -> dict:
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        # #2: 60 points over 3 days. #3: 15 points over 3 days, on a seat five
+        # times the size, so 25/day once the weight is declared.
+        return {
+            "1": _usage7(95, 50, d(5)),
+            "2": _usage7(10, 40, d(3)),
+            "3": _usage7(10, 85, d(3)),
+        }
+
+    def test_a_changed_setting_lands_on_the_next_tick(self, temp_home):
+        """No restart: the weight is declared after the engine was built."""
+        h = self._harness(temp_home)
+        live = {"value": h.engine.settings}
+        h.engine._settings_provider = lambda: live["value"]
+
+        live["value"] = replace(h.engine.settings, account_weights="3:5")
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_without_the_change_the_same_fleet_goes_elsewhere(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine._settings_provider = lambda: h.engine.settings
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_session_threshold_outranks_the_file(self, temp_home):
+        """The TUI's override must survive a reload, or it would be undone."""
+        h = self._harness(temp_home)
+        h.engine._settings_provider = lambda: replace(
+            h.engine.settings, threshold=95.0
+        )
+        h.engine.apply_threshold(60.0)
+        h.engine._refresh_settings()
+        assert h.engine.settings.threshold == 60.0
+
+    def test_a_failing_provider_leaves_the_policy_alone(self, temp_home):
+        """A half-written settings file must not change a running policy."""
+        h = self._harness(temp_home)
+        before = h.engine.settings
+
+        def boom():
+            raise OSError("settings.json vanished")
+
+        h.engine._settings_provider = boom
+        h.engine._refresh_settings()
+        assert h.engine.settings == before
+
+    def test_derived_state_is_rebuilt_not_left_stale(self, temp_home):
+        """Model axes and seat weights both come off the same settings.
+
+        Updating settings alone would leave the engine deciding on one policy
+        and scheduling on another.
+        """
+        h = self._harness(temp_home)
+        h.engine._settings_provider = lambda: replace(
+            h.engine.settings, model="Fable", account_weights="3:5"
+        )
+        h.engine._refresh_settings()
+        assert h.engine._models == ("Fable",)
+        assert h.engine._weights == {"3": 5.0}

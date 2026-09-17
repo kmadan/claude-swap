@@ -692,6 +692,7 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        settings_provider: Callable[[], AutoSwitchSettings] | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
@@ -703,6 +704,13 @@ class AutoSwitchEngine:
         self._models = parse_model_names(settings.model)
         # Relative seat capacity, read only by the `runway` strategy.
         self._weights = parse_account_weights(settings.account_weights)
+        # Asked once per tick when present, so a `cswap config set` reaches a
+        # running loop instead of waiting for a restart. None keeps the
+        # historical behaviour: whatever was passed in, for the life of the
+        # engine.
+        self._settings_provider = settings_provider
+        # A TUI session override outranks the file, and must survive a reload.
+        self._session_threshold: float | None = None
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
@@ -733,6 +741,34 @@ class AutoSwitchEngine:
         self._model_check_done = not self._models
 
     # -- state file ---------------------------------------------------------
+
+    def _refresh_settings(self) -> None:
+        """Adopt the current settings, with everything derived from them.
+
+        Called at the top of each tick. Derived state is rebuilt rather than
+        left stale: the model axes feed window selection and the poll
+        scheduler, the seat weights feed the runway ranking, and the threshold
+        feeds the persisted poll plans, so a settings change that updated only
+        ``self.settings`` would leave the engine deciding on one policy and
+        scheduling on another.
+        """
+        if self._settings_provider is None:
+            return
+        try:
+            fresh = self._settings_provider()
+        except Exception:  # a provider that fails must not stop the loop
+            return
+        if self._session_threshold is not None:
+            fresh = replace(fresh, threshold=self._session_threshold)
+        if fresh == self.settings:
+            return
+        self.settings = fresh
+        self._models = parse_model_names(fresh.model)
+        self._weights = parse_account_weights(fresh.account_weights)
+        self.switcher.set_poll_policy_inputs(fresh.threshold, self._models)
+        # The typo guard reruns against the new model list rather than staying
+        # satisfied by the old one.
+        self._model_check_done = not self._models
 
     def _state_lock(self) -> FileLock:
         return FileLock(self.state_path.parent / ".autoswitch_state.lock")
@@ -926,6 +962,7 @@ class AutoSwitchEngine:
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
         try:
+            self._refresh_settings()
             return self._tick_inner()
         except ClaudeSwitchError as e:
             self._emit(ErrorEvent(message=str(e), transient=True))
@@ -2399,6 +2436,7 @@ class AutoSwitchEngine:
         cadence mid-run. Threshold only — the model axes (and their derived
         state) are fixed at construction. The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
+        self._session_threshold = threshold
         self.settings = replace(self.settings, threshold=threshold)
         self.switcher.set_poll_policy_inputs(threshold, self._models)
 
