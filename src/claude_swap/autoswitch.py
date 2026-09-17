@@ -142,6 +142,15 @@ HORIZON_HEADROOM_RATIO = 2.0
 # re-admitted through a one-way fallback used only when nothing else
 # qualifies.
 
+# Anti-flap margin for the `runway` strategy's below-threshold move, as a
+# RATIO for the same reason HORIZON_HEADROOM_RATIO is one: percentage points
+# would let a one-point edge move the engine, the target would burn it back,
+# and it would ping-pong. At 2.0 the reverse move needs the account we left to
+# hold twice the runway of the one we took, which a freshly-reset week does not
+# lose by working normally. The move is therefore effectively one-way until a
+# weekly window rolls over and genuinely changes the picture.
+RUNWAY_MARGIN_RATIO = 2.0
+
 # Below this an account is spent, and headroom comparisons between two spent
 # accounts compare noise (a point is under ten minutes of work, less than two
 # poll intervals). When EVERY candidate is down here, rank by reset instead —
@@ -1004,7 +1013,13 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                if settings.strategy != "consume-first":
+                if settings.strategy == "runway":
+                    # Below the threshold and still working, but sitting on an
+                    # account with little runway spends the one that would have
+                    # bridged a gap later. Candidate selection decides whether
+                    # anything offers materially more; this only opens the door.
+                    trigger = "runway"
+                elif settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -1017,11 +1032,13 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
-                # consume-first: below the threshold we still proactively move to
-                # whichever account's weekly window resets soonest, to burn the
-                # most-perishable quota first. Candidate selection decides whether
-                # a sooner-resetting account with room actually exists.
-                trigger = "consume-first"
+                else:
+                    # consume-first: below the threshold we still proactively
+                    # move to whichever account's weekly window resets soonest,
+                    # to burn the most-perishable quota first. Candidate
+                    # selection decides whether a sooner-resetting account with
+                    # room actually exists.
+                    trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
@@ -1072,7 +1089,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if trigger in ("proactive", "consume-first", "runway") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1214,7 +1231,7 @@ class AutoSwitchEngine:
             now=decided_now,
         )
 
-        if trigger == "consume-first" and ordered:
+        if trigger in ("consume-first", "runway") and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1246,7 +1263,10 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if not ordered and api_key_candidates and trigger not in (
+            "consume-first",
+            "runway",
+        ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
@@ -1263,6 +1283,17 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
+            if trigger == "runway":
+                # Below the threshold and healthy, with nothing offering
+                # materially more runway. Staying is the right answer, and
+                # saying so distinguishes a working strategy from an inert one.
+                detail = (
+                    "active account's weekly reset time is unknown"
+                    if _weekly_runway(usage.get(current), decided_now) is None
+                    else f"no account offers {RUNWAY_MARGIN_RATIO:g}x the runway"
+                )
+                self._emit(NoSwitchEvent(reason="already-best-runway", detail=detail))
+                return TickOutcome.NO_ACTION
             if trigger == "consume-first":
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
@@ -1808,6 +1839,10 @@ class AutoSwitchEngine:
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
+        # What the account we are on can still sustain. A below-threshold runway
+        # move is measured against this, so an unknown value blocks the move
+        # rather than licensing one on no evidence.
+        active_runway = _weekly_runway(usage.get(current), now) if by_runway else None
         # When NOTHING is below the threshold — the active account and every
         # candidate all in the 90s — "land somewhere healthy" has no answer,
         # and holding out for one costs the user the session. Sitting still
@@ -1870,12 +1905,13 @@ class AutoSwitchEngine:
                 if (consume_first or by_runway)
                 else None
             )
+            cand_runway = _weekly_runway(usage.get(num), now) if by_runway else None
             recovery_ts = (
                 _binding_recovery_ts(usage.get(num), self._models, now)
                 if all_above
                 else 0.0
             )
-            if trigger in ("proactive", "consume-first"):
+            if trigger in ("proactive", "consume-first", "runway"):
                 # Landing must be healthy: an account at/over the threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
@@ -1939,13 +1975,27 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
+                elif by_runway:
+                    # Above the threshold the active account has to be left, so
+                    # any healthy candidate qualifies and the sort picks the
+                    # most sustainable. Below it, staying is also correct, so a
+                    # candidate must offer RUNWAY_MARGIN_RATIO times what we
+                    # already hold before the move is worth its cost: every
+                    # switch re-reads credentials and interrupts whatever is
+                    # running.
+                    if trigger == "runway" and (
+                        cand_runway is None
+                        or active_runway is None
+                        or cand_runway < active_runway * RUNWAY_MARGIN_RATIO
+                    ):
+                        continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
                     # qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if all_above and trigger in ("proactive", "consume-first"):
+            if all_above and trigger in ("proactive", "consume-first", "runway"):
                 # Ranked on the axis its own gate decided, and TIERED so the two
                 # stay comparable: a candidate returning inside the horizon
                 # beats one that does not, whatever its headroom. Untiered, the
@@ -1982,8 +2032,10 @@ class AutoSwitchEngine:
                 # away outranks both. An account whose weekly window or reset
                 # cannot be read sorts last rather than being treated as
                 # infinite runway, with binding headroom breaking ties.
-                runway = _weekly_runway(usage.get(num), now)
-                key = (-runway if runway is not None else float("inf"), -h)
+                key = (
+                    -cand_runway if cand_runway is not None else float("inf"),
+                    -h,
+                )
             else:
                 key = (-h,)
             qualifying.append((key, num))
@@ -2166,7 +2218,7 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in ("proactive", "consume-first", "runway") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 

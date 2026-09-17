@@ -6965,22 +6965,71 @@ class TestRunwayStrategy:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
-    def test_below_threshold_it_stays_put(self, temp_home):
-        """Unlike consume-first, runway never nudges below the threshold.
+    def test_below_threshold_it_moves_when_a_candidate_holds_far_more(self, temp_home):
+        """Sitting below the threshold on a nearly-spent account is the failure.
 
-        A candidate holding more runway is not a reason to abandon an account
-        that is still working; acting on it would churn the switch for no gain.
+        The engine would otherwise drive that account to its weekly limit and
+        lose it from the pool for days, which is the whole thing the strategy
+        exists to avoid. #1 sustains 10 points a day and #2 sustains 25, so #2
+        clears the 2x margin.
+        """
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 85, self._in_days(h, 1.5)),
+            "2": _usage7(10, 0, self._in_days(h, 4)),
+            "3": _usage7(10, 90, self._in_days(h, 6)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "runway"
+
+    def test_below_threshold_it_stays_for_a_comparable_candidate(self, temp_home):
+        """A modest edge is not worth a switch.
+
+        Every move re-reads credentials and interrupts whatever is running, so
+        the candidate must clear RUNWAY_MARGIN_RATIO. Here #2 leads #1 by well
+        under that.
         """
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
             "1": _usage7(20, 50, self._in_days(h, 5)),
-            "2": _usage7(10, 20, self._in_days(h, 7)),
+            "2": _usage7(10, 40, self._in_days(h, 5)),
             "3": _usage7(10, 85, self._in_days(h, 3)),
         })
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["below-threshold"]
+        assert reasons == ["already-best-runway"]
+
+    def test_the_move_does_not_reverse(self, temp_home):
+        """The ratio has to make the return trip unmeetable, or it flaps.
+
+        Landing on the account with far more runway must not immediately make
+        the account just left look attractive by the same rule.
+        """
+        h = self._harness(temp_home)
+        fleet = {
+            "1": _usage7(20, 85, self._in_days(h, 1.5)),   # 10 points/day
+            "2": _usage7(10, 0, self._in_days(h, 4)),      # 25 points/day
+            "3": _usage7(10, 90, self._in_days(h, 6)),
+        }
+        assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(3600.0)
+        assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+
+    def test_an_unknown_active_runway_does_not_license_a_move(self, temp_home):
+        """No basis for comparison means no below-threshold move."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 85),
+            "2": _usage7(10, 20, self._in_days(h, 5)),
+            "3": _usage7(10, 90, self._in_days(h, 6)),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
 
     def test_an_unreadable_weekly_window_sorts_last(self, temp_home):
         """Unknown runway is not infinite runway.
