@@ -147,13 +147,19 @@ HORIZON_HEADROOM_RATIO = 2.0
 # re-admitted through a one-way fallback used only when nothing else
 # qualifies.
 
-# Anti-flap margin for the `runway` strategy's below-threshold move, as a
-# RATIO for the same reason HORIZON_HEADROOM_RATIO is one: percentage points
-# would let a one-point edge move the engine, the target would burn it back,
-# and it would ping-pong. At 2.0 the reverse move needs the account we left to
-# hold twice the runway of the one we took, which a freshly-reset week does not
-# lose by working normally. The move is therefore effectively one-way until a
-# weekly window rolls over and genuinely changes the picture.
+# Default anti-flap margin for the `runway` strategy's below-threshold move,
+# overridable per install through ``autoswitch.runwayMargin``. A RATIO for the
+# same reason HORIZON_HEADROOM_RATIO is one: percentage points would let a
+# one-point edge move the engine, the target would burn it back, and it would
+# ping-pong. At 2.0 the reverse move needs the account we left to hold twice
+# the runway of the one we took, which a freshly-reset week does not lose by
+# working normally.
+#
+# The right value is a trade the operator makes, not a constant: lower spends
+# perishable quota sooner at the cost of more switches, higher defers the
+# hand-off to the next time a window fills. It cannot go below 1.0 in the
+# schema, because at 1.0 two near-equal accounts trade places on measurement
+# noise.
 RUNWAY_MARGIN_RATIO = 2.0
 
 # Below this an account is spent, and headroom comparisons between two spent
@@ -1344,7 +1350,10 @@ class AutoSwitchEngine:
                         self._weights.get(current, 1.0),
                     )
                     is None
-                    else f"no account offers {RUNWAY_MARGIN_RATIO:g}x the runway"
+                    else (
+                        "no account offers "
+                        f"{self.settings.runway_margin:g}x the runway"
+                    )
                 )
                 self._emit(NoSwitchEvent(reason="already-best-runway", detail=detail))
                 return TickOutcome.NO_ACTION
@@ -2048,7 +2057,7 @@ class AutoSwitchEngine:
                     if trigger == "runway" and (
                         cand_runway is None
                         or active_runway is None
-                        or cand_runway < active_runway * RUNWAY_MARGIN_RATIO
+                        or cand_runway < active_runway * settings.runway_margin
                     ):
                         continue
                 elif active_headroom is not None:

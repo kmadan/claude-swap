@@ -7235,3 +7235,62 @@ class TestLiveSettings:
         h.engine._refresh_settings()
         assert h.engine._models == ("Fable",)
         assert h.engine._weights == {"3": 5.0}
+
+
+class TestRunwayMargin:
+    """autoswitch.runwayMargin — how far ahead a candidate must be to take over."""
+
+    def _harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="runway", **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    @staticmethod
+    def _fleet(h: EngineHarness) -> dict:
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        # Active sustains 10/day, the candidate 17/day: 1.7x, the shape of a
+        # real fleet where the default margin holds and a lower one moves.
+        return {
+            "1": _usage7(20, 70, d(3)),
+            "2": _usage7(10, 66, d(2)),
+        }
+
+    def test_the_default_margin_holds_at_1_7x(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_a_lower_margin_takes_the_same_move(self, temp_home):
+        h = self._harness(temp_home, runway_margin=1.25)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_the_move_still_does_not_reverse_at_the_lower_margin(self, temp_home):
+        h = self._harness(temp_home, runway_margin=1.25)
+        fleet = self._fleet(h)
+        assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
+        h.clock.advance(3600.0)
+        assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+
+    def test_the_hold_reports_the_configured_margin(self, temp_home):
+        h = self._harness(temp_home, runway_margin=3.0)
+        h.tick_with_usage(self._fleet(h))
+        hold = next(
+            e for e in h.events
+            if isinstance(e, NoSwitchEvent) and e.reason == "already-best-runway"
+        )
+        assert "3x" in hold.detail
+
+    def test_a_live_change_of_the_margin_lands_on_the_next_tick(self, temp_home):
+        """The setting is worth having only if it does not need a restart."""
+        h = self._harness(temp_home)
+        h.engine._settings_provider = lambda: h.engine.settings
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.NO_ACTION
+        loosened = replace(h.engine.settings, runway_margin=1.25)
+        h.engine._settings_provider = lambda: loosened
+        h.clock.advance(3600.0)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2

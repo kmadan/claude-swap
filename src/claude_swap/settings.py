@@ -81,6 +81,12 @@ class AutoSwitchSettings:
     # compared ACROSS accounts; every threshold decision stays per account and
     # is unaffected. Unlisted slots weigh 1.
     account_weights: str = ""
+    # How far ahead a candidate must be before `runway` moves below the
+    # threshold, as a multiple of what the active account sustains. A ratio
+    # rather than points so the return trip cannot qualify on a small edge;
+    # 1.0 would move on any improvement and flap between near-equal
+    # accounts. Read only by the `runway` strategy.
+    runway_margin: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -171,6 +177,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "accountWeights", "account_weights", "string",
             help="Relative seat capacity per slot for `runway`, e.g. 6:5",
+        ),
+        SettingSpec(
+            "autoswitch", "runwayMargin", "runway_margin", "float", 1.05, 10.0,
+            help="How many times the active account's runway a candidate needs",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
