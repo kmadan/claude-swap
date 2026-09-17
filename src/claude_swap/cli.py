@@ -664,7 +664,7 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=("best", "consume-first", "runway"),
         default=None,
         help=(
             "Target selection: 'best' (most quota left; default) or "

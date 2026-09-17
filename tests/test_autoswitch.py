@@ -28,6 +28,7 @@ from claude_swap.autoswitch import (
     TickOutcome,
     UnquarantineEvent,
     _recovery_is_useful,
+    _weekly_runway,
     pct_label,
 )
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
@@ -6894,3 +6895,150 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+# --- runway strategy -----------------------------------------------------------
+
+
+class TestRunwayStrategy:
+    """`runway` ranks by weekly headroom per day until that headroom resets.
+
+    The objective it serves is continuity rather than thrift: an account driven
+    to its weekly limit leaves the rotation pool for days, so the account worth
+    spending is the one that can sustain the most work before its own quota
+    refreshes, not merely the one whose quota expires soonest.
+    """
+
+    def _harness(self, temp_home: Path, strategy: str = "runway") -> EngineHarness:
+        h = EngineHarness(temp_home, strategy=strategy)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    @staticmethod
+    def _in_days(h: EngineHarness, days: float) -> str:
+        return _iso_at(h.clock.now + days * 86400.0)
+
+    def _fleet(self, h: EngineHarness) -> dict:
+        """Active over threshold, so a move is forced and only ranking decides.
+
+        #2 holds 80 points and resets in seven days (11.4 points/day). #3 holds
+        15 and resets in three (5.0 points/day), so it is the account that would
+        drop out of the pool soonest. Both sit under the threshold, so both are
+        eligible and only the ranking separates them.
+        """
+        return {
+            "1": _usage7(95, 50, self._in_days(h, 5)),
+            "2": _usage7(10, 20, self._in_days(h, 7)),   # 80 points over 7 days
+            "3": _usage7(10, 85, self._in_days(h, 3)),   # 15 points over 3 days
+        }
+
+    def test_prefers_the_account_with_the_most_sustainable_rate(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_consume_first_takes_the_other_one_on_the_same_fleet(self, temp_home):
+        """The contrast that makes the strategy worth having.
+
+        Identical usage, and consume-first lands on the nearly-spent account
+        because its weekly window resets sooner.
+        """
+        h = self._harness(temp_home, strategy="consume-first")
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_imminent_reset_outranks_a_fresh_week(self, temp_home):
+        """Points that expire in two hours are spent before a fresh week.
+
+        Nothing is lost by taking them: that account's quota refreshes straight
+        after, so the pool is not shortened by the visit.
+        """
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 50, self._in_days(h, 5)),
+            "2": _usage7(10, 20, self._in_days(h, 7)),
+            "3": _usage7(10, 85, self._in_days(h, 2 / 24)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_below_threshold_it_stays_put(self, temp_home):
+        """Unlike consume-first, runway never nudges below the threshold.
+
+        A candidate holding more runway is not a reason to abandon an account
+        that is still working; acting on it would churn the switch for no gain.
+        """
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 50, self._in_days(h, 5)),
+            "2": _usage7(10, 20, self._in_days(h, 7)),
+            "3": _usage7(10, 85, self._in_days(h, 3)),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+    def test_an_unreadable_weekly_window_sorts_last(self, temp_home):
+        """Unknown runway is not infinite runway.
+
+        #3 carries no weekly reset, so its rate cannot be computed. It must not
+        outrank a candidate whose rate is known and real.
+        """
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 50, self._in_days(h, 5)),
+            "2": _usage7(10, 60, self._in_days(h, 7)),
+            "3": _usage7(10, 0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_headroom_breaks_a_tie_between_equal_rates(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 50, self._in_days(h, 5)),
+            "2": _usage7(60, 50, self._in_days(h, 4)),
+            "3": _usage7(10, 50, self._in_days(h, 4)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+
+class TestWeeklyRunway:
+    """_weekly_runway — the rate itself."""
+
+    NOW = 1_000_000.0
+
+    def _usage(self, pct7: float, days: float | None) -> dict:
+        seven: dict = {"pct": pct7}
+        if days is not None:
+            seven["resets_at"] = _iso_at(self.NOW + days * 86400.0)
+        return {"five_hour": {"pct": 0.0}, "seven_day": seven}
+
+    def test_a_fresh_week_rates_above_a_spent_one(self):
+        fresh = _weekly_runway(self._usage(0.0, 7.0), self.NOW)
+        spent = _weekly_runway(self._usage(95.0, 3.0), self.NOW)
+        assert fresh > spent
+
+    def test_points_per_day(self):
+        assert _weekly_runway(self._usage(30.0, 7.0), self.NOW) == pytest.approx(10.0)
+
+    def test_an_imminent_reset_rates_highest(self):
+        assert _weekly_runway(self._usage(95.0, 1 / 24), self.NOW) > _weekly_runway(
+            self._usage(0.0, 7.0), self.NOW
+        )
+
+    def test_an_exhausted_week_rates_zero(self):
+        assert _weekly_runway(self._usage(100.0, 3.0), self.NOW) == 0.0
+
+    @pytest.mark.parametrize("usage", [None, "api key", {}, {"seven_day": {}}])
+    def test_unreadable_usage_is_unknown_not_zero(self, usage):
+        assert _weekly_runway(usage, self.NOW) is None
+
+    def test_a_past_reset_is_unknown(self):
+        """Mirrors _seven_day_reset_ts: a stale snapshot is not a rate."""
+        assert _weekly_runway(self._usage(50.0, -1.0), self.NOW) is None

@@ -591,6 +591,32 @@ def _binding_recovery_ts(
     return ts if ts is not None and ts > now else float("inf")
 
 
+def _weekly_runway(usage: dict | str | None, now: float) -> float | None:
+    """Weekly headroom per day until that headroom resets, or None if unknown.
+
+    The rate an account can sustain before its own quota refreshes. It ranks an
+    account with a fresh week above one that is nearly spent, and it ranks a
+    nearly-spent account whose reset is imminent above both, because those
+    points expire either way. ``consume-first`` is the special case of this
+    that reads only the denominator, which is why it picks an account with
+    three points left over one with a hundred whenever the three reset sooner.
+
+    Percentages are per account, so this compares seats as though a point of
+    one were a point of another. Where seat classes differ in size that is an
+    approximation, and what it produces is a ranking rather than a measurement.
+    """
+    ts = _seven_day_reset_ts(usage, now)
+    if ts is None or not isinstance(usage, dict):
+        return None
+    window = usage.get("seven_day")
+    if not isinstance(window, dict) or not isinstance(window.get("pct"), (int, float)):
+        return None
+    days = (ts - now) / 86400.0
+    if days <= 0:
+        return None
+    return (100.0 - float(window["pct"])) / days
+
+
 def _every_account_above_threshold(
     candidates: Sequence[str],
     headroom: dict[str, float | None],
@@ -1099,6 +1125,7 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
+        by_runway = settings.strategy == "runway"
 
         def _rank(**kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
@@ -1177,6 +1204,7 @@ class AutoSwitchEngine:
         ordered, any_known, active_reset_ts = _rank(
             trigger=trigger,
             consume_first=consume_first,
+            by_runway=by_runway,
             oauth_candidates=oauth_candidates,
             usage=usage,
             headroom=headroom,
@@ -1208,6 +1236,7 @@ class AutoSwitchEngine:
             ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
+                by_runway=by_runway,
                 oauth_candidates=oauth_candidates,
                 usage=usage,
                 headroom=headroom,
@@ -1757,6 +1786,7 @@ class AutoSwitchEngine:
         *,
         trigger: str,
         consume_first: bool,
+        by_runway: bool = False,
         oauth_candidates: list[str],
         no_return: str | None,
         usage: dict[str, dict | str | None],
@@ -1836,7 +1866,9 @@ class AutoSwitchEngine:
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
             reset_ts = (
-                _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+                _seven_day_reset_ts(usage.get(num), now)
+                if (consume_first or by_runway)
+                else None
             )
             recovery_ts = (
                 _binding_recovery_ts(usage.get(num), self._models, now)
@@ -1942,6 +1974,16 @@ class AutoSwitchEngine:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
+            elif by_runway:
+                # Highest sustainable rate first: weekly headroom divided by the
+                # days until it resets. An account whose week has just rolled
+                # over outranks one holding a few points it cannot spend before
+                # its own reset, and a nearly-spent account whose reset is hours
+                # away outranks both. An account whose weekly window or reset
+                # cannot be read sorts last rather than being treated as
+                # infinite runway, with binding headroom breaking ties.
+                runway = _weekly_runway(usage.get(num), now)
+                key = (-runway if runway is not None else float("inf"), -h)
             else:
                 key = (-h,)
             qualifying.append((key, num))
