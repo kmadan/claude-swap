@@ -20,6 +20,7 @@ from claude_swap.settings import (
     load_settings,
     load_ui_settings,
     merged_with_cli,
+    parse_account_weights,
     parse_window_labels,
     parse_window_thresholds,
     save_settings,
@@ -422,3 +423,24 @@ class TestWindowSettingsRoundTrip:
         loaded = load_settings(tmp_path)
         assert loaded.windows == "5h"
         assert loaded.window_thresholds == "5h:85,7d:97"
+
+
+class TestParseAccountWeights:
+    """autoswitch.accountWeights -> relative seat capacity per slot."""
+
+    def test_pairs(self):
+        assert parse_account_weights("6:5,2:1") == {"6": 5.0, "2": 1.0}
+
+    @pytest.mark.parametrize("value", [None, ""])
+    def test_empty_means_every_slot_weighs_one(self, value):
+        assert parse_account_weights(value) == {}
+
+    @pytest.mark.parametrize("value", ["6:x", "6", "6:", ":5", "6:0", "6:-2", "6:inf"])
+    def test_unusable_pairs_are_dropped_not_raised(self, value):
+        assert parse_account_weights(value) == {}
+
+    def test_a_bad_pair_does_not_discard_the_good_ones(self):
+        assert parse_account_weights("6:5,2:x") == {"6": 5.0}
+
+    def test_fractional_weights_are_allowed(self):
+        assert parse_account_weights("3:0.2") == {"3": 0.2}

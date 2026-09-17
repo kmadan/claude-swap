@@ -7091,3 +7091,72 @@ class TestWeeklyRunway:
     def test_a_past_reset_is_unknown(self):
         """Mirrors _seven_day_reset_ts: a stale snapshot is not a rate."""
         assert _weekly_runway(self._usage(50.0, -1.0), self.NOW) is None
+
+
+class TestAccountWeights:
+    """A weighted seat's points are worth proportionally more work."""
+
+    NOW = 1_000_000.0
+
+    def _usage(self, pct7: float, days: float) -> dict:
+        return {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {
+                "pct": pct7,
+                "resets_at": _iso_at(self.NOW + days * 86400.0),
+            },
+        }
+
+    def test_weight_scales_the_rate(self):
+        base = _weekly_runway(self._usage(80.0, 2.0), self.NOW)
+        assert _weekly_runway(self._usage(80.0, 2.0), self.NOW, 5.0) == pytest.approx(
+            base * 5
+        )
+
+    def test_a_large_seat_near_its_limit_can_outrank_a_small_fresh_one(self):
+        """The case the ratio exists for.
+
+        13 points of a seat holding five times as much is 65 points of work,
+        against 96 on the small seat, and they expire in less than half the
+        time. Unweighted the comparison inverts, which is the error the weight
+        removes.
+        """
+        large = _weekly_runway(self._usage(87.0, 2.9), self.NOW, 5.0)
+        small = _weekly_runway(self._usage(4.0, 6.9), self.NOW, 1.0)
+        assert large > small
+        unweighted = _weekly_runway(self._usage(87.0, 2.9), self.NOW, 1.0)
+        assert unweighted < small
+
+    def test_the_engine_ranks_on_the_weighted_rate(self, temp_home):
+        h = EngineHarness(
+            temp_home, strategy="runway", account_weights="3:5"
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        # #2 holds 60 points over 3 days (20/day). #3 holds 15 over 3 days, but
+        # its seat is five times the size, so 25/day.
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 50, d(5)),
+            "2": _usage7(10, 40, d(3)),
+            "3": _usage7(10, 85, d(3)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_without_the_weight_the_same_fleet_goes_the_other_way(self, temp_home):
+        h = EngineHarness(temp_home, strategy="runway")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 50, d(5)),
+            "2": _usage7(10, 40, d(3)),
+            "3": _usage7(10, 85, d(3)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2

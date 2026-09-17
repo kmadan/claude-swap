@@ -73,6 +73,14 @@ class AutoSwitchSettings:
     # ``threshold``. A window at ``oauth.WINDOW_EXHAUSTED_PCT`` blocks
     # whatever is configured here.
     window_thresholds: str = ""
+    # Relative capacity per account slot, e.g. "6:5" when slot 6 is a seat
+    # holding five times what the others hold. Percentages are reported
+    # against each account's own limit, so without this a point of a large
+    # seat and a point of a small one compare as equal, which they are not.
+    # Read only by the `runway` strategy, which is the only place capacity is
+    # compared ACROSS accounts; every threshold decision stays per account and
+    # is unaffected. Unlisted slots weigh 1.
+    account_weights: str = ""
 
 
 @dataclass(frozen=True)
@@ -161,6 +169,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Per-window switch limits, e.g. 5h:90,7d:97 (blank = threshold)",
         ),
         SettingSpec(
+            "autoswitch", "accountWeights", "account_weights", "string",
+            help="Relative seat capacity per slot for `runway`, e.g. 6:5",
+        ),
+        SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
         ),
@@ -230,6 +242,29 @@ def parse_window_thresholds(value: str | None) -> dict[str, float]:
         if label and 1.0 <= pct <= 100.0:
             limits[label] = pct
     return limits
+
+
+def parse_account_weights(value: str | None) -> dict[str, float]:
+    """Split ``autoswitch.accountWeights`` into ``{slot: weight}``.
+
+    Accepts "6:5,2:1". A pair that does not parse, or carries a weight that is
+    not positive and finite, is dropped rather than raising: that slot then
+    weighs 1, which is the documented default, and one bad pair never costs the
+    others their weight.
+    """
+    weights: dict[str, float] = {}
+    if not value:
+        return weights
+    for part in value.split(","):
+        slot, _, raw = part.partition(":")
+        slot = slot.strip()
+        try:
+            weight = float(raw.strip())
+        except ValueError:
+            continue
+        if slot and weight > 0 and weight != float("inf"):
+            weights[slot] = weight
+    return weights
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:

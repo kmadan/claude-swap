@@ -51,7 +51,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    parse_account_weights,
+    parse_model_names,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -600,7 +605,9 @@ def _binding_recovery_ts(
     return ts if ts is not None and ts > now else float("inf")
 
 
-def _weekly_runway(usage: dict | str | None, now: float) -> float | None:
+def _weekly_runway(
+    usage: dict | str | None, now: float, weight: float = 1.0
+) -> float | None:
     """Weekly headroom per day until that headroom resets, or None if unknown.
 
     The rate an account can sustain before its own quota refreshes. It ranks an
@@ -610,9 +617,12 @@ def _weekly_runway(usage: dict | str | None, now: float) -> float | None:
     that reads only the denominator, which is why it picks an account with
     three points left over one with a hundred whenever the three reset sooner.
 
-    Percentages are per account, so this compares seats as though a point of
-    one were a point of another. Where seat classes differ in size that is an
-    approximation, and what it produces is a ranking rather than a measurement.
+    ``weight`` is that account's capacity relative to the others
+    (``autoswitch.accountWeights``), which is what makes a comparison across
+    accounts meaningful: a percentage is reported against each account's own
+    limit, so on a seat holding five times as much, one point is five times the
+    work. Unweighted, a large seat reads as nearly spent while it still holds
+    more than a small one that reads as fresh.
     """
     ts = _seven_day_reset_ts(usage, now)
     if ts is None or not isinstance(usage, dict):
@@ -623,7 +633,7 @@ def _weekly_runway(usage: dict | str | None, now: float) -> float | None:
     days = (ts - now) / 86400.0
     if days <= 0:
         return None
-    return (100.0 - float(window["pct"])) / days
+    return weight * (100.0 - float(window["pct"])) / days
 
 
 def _every_account_above_threshold(
@@ -691,6 +701,8 @@ class AutoSwitchEngine:
         # pass everywhere usage windows are read — decisions, cadence, and
         # reset scheduling must all see the same axes.
         self._models = parse_model_names(settings.model)
+        # Relative seat capacity, read only by the `runway` strategy.
+        self._weights = parse_account_weights(settings.account_weights)
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
@@ -1289,7 +1301,12 @@ class AutoSwitchEngine:
                 # saying so distinguishes a working strategy from an inert one.
                 detail = (
                     "active account's weekly reset time is unknown"
-                    if _weekly_runway(usage.get(current), decided_now) is None
+                    if _weekly_runway(
+                        usage.get(current),
+                        decided_now,
+                        self._weights.get(current, 1.0),
+                    )
+                    is None
                     else f"no account offers {RUNWAY_MARGIN_RATIO:g}x the runway"
                 )
                 self._emit(NoSwitchEvent(reason="already-best-runway", detail=detail))
@@ -1842,7 +1859,11 @@ class AutoSwitchEngine:
         # What the account we are on can still sustain. A below-threshold runway
         # move is measured against this, so an unknown value blocks the move
         # rather than licensing one on no evidence.
-        active_runway = _weekly_runway(usage.get(current), now) if by_runway else None
+        active_runway = (
+            _weekly_runway(usage.get(current), now, self._weights.get(current, 1.0))
+            if by_runway
+            else None
+        )
         # When NOTHING is below the threshold — the active account and every
         # candidate all in the 90s — "land somewhere healthy" has no answer,
         # and holding out for one costs the user the session. Sitting still
@@ -1905,7 +1926,11 @@ class AutoSwitchEngine:
                 if (consume_first or by_runway)
                 else None
             )
-            cand_runway = _weekly_runway(usage.get(num), now) if by_runway else None
+            cand_runway = (
+                _weekly_runway(usage.get(num), now, self._weights.get(num, 1.0))
+                if by_runway
+                else None
+            )
             recovery_ts = (
                 _binding_recovery_ts(usage.get(num), self._models, now)
                 if all_above
