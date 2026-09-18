@@ -1717,20 +1717,45 @@ class TestScaledLimit:
     def test_a_weight_of_one_changes_nothing(self):
         assert oauth.scaled_limit(97.0, 1.0) == 97.0
 
-    def test_the_reserve_is_divided_by_the_weight(self):
-        # 3 points held back on a 5x seat is 0.6 points of that seat.
-        assert oauth.scaled_limit(97.0, 5.0) == pytest.approx(99.4)
+    def test_the_reserve_is_divided_by_the_weight_then_floored(self):
+        # 3 points held back on a 5x seat is 0.6 points of that seat, floored
+        # to 1 because utilization is reported in whole percent.
+        assert oauth.scaled_limit(97.0, 5.0) == 99.0
 
     def test_the_five_hour_margin_scales_the_same_way(self):
-        assert oauth.scaled_limit(92.0, 5.0) == pytest.approx(98.4)
+        assert oauth.scaled_limit(92.0, 5.0) == 98.0
 
-    def test_the_absolute_reserve_is_what_stays_constant(self):
-        """The property the scaling exists to preserve, stated directly."""
+    def test_every_scaled_limit_is_reachable(self):
+        """An unreachable limit is not a limit.
+
+        Readings are whole percent, so a limit above 99 can only be crossed by
+        100, which already means exhausted. Such a limit would never step an
+        account aside, it would let it run to a hard stop.
+        """
+        for limit in (80.0, 92.0, 97.0, 99.0):
+            for weight in (2.0, 5.0, 10.0, 50.0):
+                assert oauth.scaled_limit(limit, weight) <= 99.0
+
+    def test_the_reserve_is_never_smaller_than_asked_for(self):
+        """Flooring errs toward holding back more, never less."""
         for limit in (80.0, 92.0, 97.0):
             for weight in (2.0, 5.0, 10.0):
                 reserve_small = 100.0 - limit
                 reserve_large = (100.0 - oauth.scaled_limit(limit, weight)) * weight
-                assert reserve_large == pytest.approx(reserve_small)
+                assert reserve_large >= reserve_small - 1e-9
+
+    @pytest.mark.parametrize(
+        "limit,weight,expected",
+        [
+            (97.5, 1.0, 97.0),    # a hand-written fraction floors too
+            (99.7, 1.0, 99.0),
+            (97.0, 5.0, 99.0),    # 99.4 before flooring
+            (92.0, 5.0, 98.0),    # 98.4 before flooring
+            (97.0, 50.0, 99.0),   # 99.94 before flooring
+        ],
+    )
+    def test_rounds_down_always(self, limit, weight, expected):
+        assert oauth.scaled_limit(limit, weight) == expected
 
     def test_a_nonsense_weight_leaves_the_limit_alone(self):
         assert oauth.scaled_limit(97.0, 0.0) == 97.0

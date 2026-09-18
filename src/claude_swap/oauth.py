@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import logging
 import sys
 import urllib.error
@@ -630,10 +631,24 @@ def scaled_limit(limit: float, weight: float) -> float:
     minute do not change with the seat. A margin that is constant in absolute
     terms is therefore constant in minutes of warning, which is the property
     worth keeping.
+
+    The result is floored to whole percent, because that is the resolution the
+    usage API reports: every utilization observed is an integer. An unfloored
+    99.4 would be unreachable, since the only reading at or above it is 100,
+    which already means exhausted, so the limit would do nothing at all and
+    the account would run to a hard stop instead of stepping aside. Flooring
+    moves the limit to the next value the data can actually express, which
+    reserves slightly more than asked rather than slightly less. Should the
+    API ever report fractions, the floor costs at most one point of reserve
+    and never removes the limit.
+
+    Applied to every limit, weighted or not, so a hand-written ``7d:97.5``
+    floors to 97 rather than behaving as 98 against integer readings. Rounding
+    down always errs toward holding back more.
     """
     if weight <= 0:
-        return limit
-    return 100.0 - (100.0 - limit) / weight
+        weight = 1.0
+    return float(math.floor(100.0 - (100.0 - limit) / weight))
 
 
 def effective_pct(
@@ -692,11 +707,10 @@ def relevant_windows(
     windows: list[tuple[str, float, str | None]] = []
     selected = decision_windows()
     limits, threshold = window_thresholds()
-    if weight != 1.0:
-        # The account's own limits, its seat size taken into account. Scaled
-        # here rather than at each comparison so every consumer of this funnel
-        # reads one set of numbers.
-        limits = {label: scaled_limit(v, weight) for label, v in limits.items()}
+    # The account's own limits, its seat size taken into account and floored to
+    # the whole percent the usage API reports. Resolved here rather than at each
+    # comparison so every consumer of this funnel reads one set of numbers.
+    limits = {label: scaled_limit(v, weight) for label, v in limits.items()}
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
         if not (isinstance(window, dict) and isinstance(window.get("pct"), (int, float))):
