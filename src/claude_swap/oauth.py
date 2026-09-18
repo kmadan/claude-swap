@@ -615,6 +615,27 @@ def window_thresholds() -> tuple[dict[str, float], float]:
         return {}, _DEFAULT_THRESHOLD
 
 
+def scaled_limit(limit: float, weight: float) -> float:
+    """A window limit restated for a seat of ``weight`` times the capacity.
+
+    A limit is a reserve: 7d:97 holds back the last 3% of a week. Percentages
+    are per account, so on a seat five times the size those 3 points are five
+    times the work, and the same written limit reserves five times as much.
+    Holding the reserve constant in absolute capacity instead means dividing it
+    by the weight: 97 on a 5x seat becomes 99.4, and 92 becomes 98.4.
+
+    The 5-hour case is the same arithmetic for a different reason. That margin
+    exists to cover the poll interval, the credential pickup and a burst
+    overshooting the mark, all measured in tokens per minute, and tokens per
+    minute do not change with the seat. A margin that is constant in absolute
+    terms is therefore constant in minutes of warning, which is the property
+    worth keeping.
+    """
+    if weight <= 0:
+        return limit
+    return 100.0 - (100.0 - limit) / weight
+
+
 def effective_pct(
     label: str, pct: float, limits: dict[str, float], threshold: float
 ) -> float:
@@ -645,7 +666,7 @@ def effective_pct(
 
 
 def relevant_windows(
-    usage: dict | None, models: Sequence[str] = ()
+    usage: dict | None, models: Sequence[str] = (), weight: float = 1.0
 ) -> list[tuple[str, float, str | None]]:
     """Every ``(label, pct, resets_at)`` window that gates this account.
 
@@ -671,6 +692,11 @@ def relevant_windows(
     windows: list[tuple[str, float, str | None]] = []
     selected = decision_windows()
     limits, threshold = window_thresholds()
+    if weight != 1.0:
+        # The account's own limits, its seat size taken into account. Scaled
+        # here rather than at each comparison so every consumer of this funnel
+        # reads one set of numbers.
+        limits = {label: scaled_limit(v, weight) for label, v in limits.items()}
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
         if not (isinstance(window, dict) and isinstance(window.get("pct"), (int, float))):
@@ -710,7 +736,7 @@ def relevant_windows(
 
 
 def account_headroom(
-    usage: dict | None, models: Sequence[str] = ()
+    usage: dict | None, models: Sequence[str] = (), weight: float = 1.0
 ) -> float | None:
     """Remaining percentage before this account hits a rate-limit window.
 
@@ -724,7 +750,7 @@ def account_headroom(
     or carries no window data, which callers treat as "unknown" (never
     auto-skipped).
     """
-    pcts = [pct for _, pct, _ in relevant_windows(usage, models)]
+    pcts = [pct for _, pct, _ in relevant_windows(usage, models, weight)]
     if not pcts:
         return None
     return 100.0 - max(pcts)

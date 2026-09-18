@@ -1703,3 +1703,65 @@ class TestWindowSettingResolution:
     def test_missing_settings_file_falls_back(self, temp_home):
         assert oauth.decision_windows() == frozenset({"5h", "7d"})
         assert oauth.window_thresholds() == ({}, 90.0)
+
+
+class TestScaledLimit:
+    """A window limit restated for a seat of a different size.
+
+    A limit is a reserve, and a reserve written in percentage points is a
+    different amount of work on every seat. Scaling by the weight holds it
+    constant in absolute capacity, which is what makes one written limit mean
+    the same thing across a mixed fleet.
+    """
+
+    def test_a_weight_of_one_changes_nothing(self):
+        assert oauth.scaled_limit(97.0, 1.0) == 97.0
+
+    def test_the_reserve_is_divided_by_the_weight(self):
+        # 3 points held back on a 5x seat is 0.6 points of that seat.
+        assert oauth.scaled_limit(97.0, 5.0) == pytest.approx(99.4)
+
+    def test_the_five_hour_margin_scales_the_same_way(self):
+        assert oauth.scaled_limit(92.0, 5.0) == pytest.approx(98.4)
+
+    def test_the_absolute_reserve_is_what_stays_constant(self):
+        """The property the scaling exists to preserve, stated directly."""
+        for limit in (80.0, 92.0, 97.0):
+            for weight in (2.0, 5.0, 10.0):
+                reserve_small = 100.0 - limit
+                reserve_large = (100.0 - oauth.scaled_limit(limit, weight)) * weight
+                assert reserve_large == pytest.approx(reserve_small)
+
+    def test_a_nonsense_weight_leaves_the_limit_alone(self):
+        assert oauth.scaled_limit(97.0, 0.0) == 97.0
+        assert oauth.scaled_limit(97.0, -3.0) == 97.0
+
+
+class TestWeightedWindowLimits:
+    """relevant_windows applies the account's own scaled limits."""
+
+    USAGE = {
+        "five_hour": {"pct": 10.0},
+        "seven_day": {"pct": 98.0, "resets_at": "2026-07-14T09:00:00Z"},
+    }
+
+    @pytest.fixture(autouse=True)
+    def _policy(self, monkeypatch):
+        monkeypatch.setattr(oauth, "decision_windows", lambda: frozenset({"5h", "7d"}))
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: ({"7d": 97.0}, 90.0))
+
+    def test_unweighted_the_window_blocks(self):
+        assert 100.0 - oauth.account_headroom(self.USAGE) >= 90.0
+
+    def test_on_a_larger_seat_the_same_reading_does_not_block(self):
+        """98% of a 5x seat is inside a reserve that is 99.4 for that seat."""
+        assert 100.0 - oauth.account_headroom(self.USAGE, (), 5.0) < 90.0
+
+    def test_the_larger_seat_still_blocks_past_its_own_limit(self):
+        usage = dict(self.USAGE, seven_day={"pct": 99.5})
+        assert 100.0 - oauth.account_headroom(usage, (), 5.0) >= 90.0
+
+    def test_exhaustion_is_not_scaled_away(self):
+        """100% means no request can be served, on any seat."""
+        usage = dict(self.USAGE, seven_day={"pct": 100.0})
+        assert oauth.account_headroom(usage, (), 5.0) == 0.0

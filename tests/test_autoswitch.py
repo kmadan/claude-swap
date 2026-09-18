@@ -3213,6 +3213,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         class Fake(AutoSwitchEngine):
             def __init__(self):
                 self._models = ()
+                self._weights = {}
 
         e = Fake()
         settings = AutoSwitchSettings()
@@ -3262,6 +3263,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         class Fake(AutoSwitchEngine):
             def __init__(self):
                 self._models = ()
+                self._weights = {}
 
         e = Fake()
         settings = AutoSwitchSettings()
@@ -3298,6 +3300,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         class Fake(AutoSwitchEngine):
             def __init__(self):
                 self._models = ()
+                self._weights = {}
 
         e = Fake()
         settings = AutoSwitchSettings()
