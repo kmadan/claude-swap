@@ -2107,6 +2107,15 @@ class AutoSwitchEngine:
         # Set when the active account's own reserve covers the gap, so the
         # caller can report a deliberate hold rather than a blocked fleet.
         held_on_active = False
+        # Candidates excluded by nothing except the no-return bar. Under
+        # `runway`, riding the active account into a hard limit is the one
+        # outcome the whole policy exists to avoid, and the bar's own docstring
+        # names this failure: it holds the worse account until the at-limit
+        # escape. When the active is already past its limit and the barred
+        # account is all there is, undoing the last move beats hitting 100%.
+        # Ranked last, after the thin-reserve fallback, so it is reached only
+        # when nothing else is.
+        barred: list[tuple[tuple, str]] = []
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
@@ -2115,7 +2124,13 @@ class AutoSwitchEngine:
             if h <= 0:
                 continue  # itself at its limit — never a target
             if num == no_return:
-                continue  # the account we just left; see _no_return_account
+                # See _no_return_account. Kept as a last resort rather than
+                # dropped, but only while the active account is over its limit
+                # and burning toward a hard stop: `runway` below the threshold
+                # is an optimisation, and undoing a move for it would flap.
+                if by_runway and trigger == "proactive":
+                    barred.append(((0, -(h or 0.0)), num))
+                continue
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now)
                 if (consume_first or by_runway)
@@ -2337,7 +2352,7 @@ class AutoSwitchEngine:
                 key = (-h,)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
-        qualifying = qualifying or fallback
+        qualifying = qualifying or fallback or barred
         qualifying.sort(key=lambda t: t[0])
         return (
             [num for _, num in qualifying],

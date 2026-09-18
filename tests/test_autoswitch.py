@@ -7474,3 +7474,67 @@ class TestAmberToGreenIsTakenImmediately:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+
+class TestBarredAccountIsALastResort:
+    """The no-return bar must not ride the active account into a hard limit.
+
+    Reproduces a measured incident: the engine moved 6 -> 8, which barred 6.
+    Account 8 then burned past its 92% limit while 6 was the only account under
+    its own limit. Because 6 was healthy the at-limit escape never engaged, and
+    because 6 was barred there was no legal target, so the engine held 8 from
+    95% to 100% and the session took a hard stop.
+    """
+
+    def _args(self, h: EngineHarness, active_pct: float, peer_pct: float) -> dict:
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        usage = {
+            "1": _usage7(active_pct, 26, d(6)),   # active, past its limit
+            "2": _usage7(peer_pct, 42, d(5)),     # the account just left
+        }
+        headroom = {n: oauth.account_headroom(u) for n, u in usage.items()}
+        return dict(
+            trigger="proactive",
+            consume_first=False,
+            by_runway=True,
+            oauth_candidates=["2"],
+            usage=usage,
+            headroom=headroom,
+            current="1",
+            active_headroom=headroom["1"],
+            settings=h.engine.settings,
+            now=h.clock.now,
+        )
+
+    def test_the_barred_account_is_taken_when_it_is_the_only_target(self, temp_home):
+        h = EngineHarness(temp_home, strategy="runway")
+        ordered, _, _, _ = h.engine._rank_candidates(
+            no_return="2", **self._args(h, 95.0, 12.0)
+        )
+        assert ordered == ["2"]
+
+    def test_the_bar_still_holds_when_another_target_exists(self, temp_home):
+        h = EngineHarness(temp_home, strategy="runway")
+        args = self._args(h, 95.0, 12.0)
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        args["usage"]["3"] = _usage7(5, 30, d(5))
+        args["headroom"]["3"] = oauth.account_headroom(args["usage"]["3"])
+        args["oauth_candidates"] = ["2", "3"]
+        ordered, _, _, _ = h.engine._rank_candidates(no_return="2", **args)
+        assert ordered == ["3"]
+
+    def test_the_bar_holds_for_a_below_threshold_nudge(self, temp_home):
+        """Undoing a move to optimise is how it flaps; that stays barred."""
+        h = EngineHarness(temp_home, strategy="runway")
+        args = self._args(h, 20.0, 12.0)
+        args["trigger"] = "runway"
+        args["active_headroom"] = args["headroom"]["1"]
+        ordered, _, _, _ = h.engine._rank_candidates(no_return="2", **args)
+        assert ordered == []
+
+    def test_other_strategies_keep_the_bar_absolute(self, temp_home):
+        h = EngineHarness(temp_home, strategy="best")
+        args = self._args(h, 95.0, 12.0)
+        args["by_runway"] = False
+        ordered, _, _, _ = h.engine._rank_candidates(no_return="2", **args)
+        assert ordered == []
