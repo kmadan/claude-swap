@@ -7307,3 +7307,79 @@ class TestRunwayMargin:
         h.clock.advance(3600.0)
         assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+
+class TestRunwayEscape:
+    """With nothing under its limit, the escape spends reserve.
+
+    Above the threshold an account's headroom IS its reserve: the quota between
+    its limit and exhaustion. The escape is the only time that reserve is spent,
+    so what it can deliver, and what a seat's point is worth, both matter.
+    """
+
+    def _harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="runway", **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    @staticmethod
+    def _at_limit(pct5: float, hours: float, h: EngineHarness) -> dict:
+        """Past the threshold on the 5h window, resetting in ``hours``."""
+        return {
+            "five_hour": {
+                "pct": pct5,
+                "resets_at": _iso_at(h.clock.now + hours * 3600.0),
+            },
+            "seven_day": {"pct": 50.0, "resets_at": _iso_at(h.clock.now + 5 * 86400.0)},
+        }
+
+    def test_a_larger_seats_reserve_wins_a_shared_recovery_window(self, temp_home):
+        """Both return within five minutes; the one with more work wins.
+
+        #2 holds 3 points on a standard seat, #3 holds 2 on a 5x seat, which is
+        ten points of work. Ranked on raw percentages #2 would win.
+        """
+        h = self._harness(temp_home, account_weights="3:5")
+        outcome = h.tick_with_usage({
+            "1": self._at_limit(96.0, 3.0, h),
+            "2": self._at_limit(97.0, 1.0, h),
+            "3": self._at_limit(98.0, 1.02, h),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_a_sooner_recovery_still_wins_a_separate_window(self, temp_home):
+        """Bucketing must not flatten genuinely different return times."""
+        h = self._harness(temp_home, account_weights="3:5")
+        outcome = h.tick_with_usage({
+            "1": self._at_limit(96.0, 4.0, h),
+            "2": self._at_limit(97.0, 0.2, h),
+            "3": self._at_limit(98.0, 3.0, h),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_reserve_too_thin_to_use_is_not_worth_a_switch(self, temp_home):
+        """#2 returns soonest but offers one point; #3 offers four."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": self._at_limit(95.0, 4.0, h),
+            "2": self._at_limit(99.0, 1.0, h),
+            "3": self._at_limit(96.0, 2.0, h),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_a_thin_reserve_is_still_taken_when_it_is_all_there_is(self, temp_home):
+        """The floor defers a candidate, it never discards one."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": self._at_limit(95.0, 4.0, h),
+            "2": self._at_limit(99.0, 1.0, h),
+            "3": self._at_limit(99.0, 3.0, h),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2

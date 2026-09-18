@@ -162,6 +162,15 @@ HORIZON_HEADROOM_RATIO = 2.0
 # noise.
 RUNWAY_MARGIN_RATIO = 2.0
 
+# Least weighted reserve worth a switch during the at-limit escape. Every
+# switch costs a credential pickup and interrupts whatever is running, so
+# landing on an account that can serve for seconds is worse than staying put
+# and waiting for the next reset. Two points against the measured burn of
+# roughly 0.8 points a minute is about two and a half minutes of work. A
+# candidate below the floor is not discarded: it goes to the one-way fallback
+# and is taken only when nothing else qualifies.
+ESCAPE_MIN_RESERVE_PCT = 2.0
+
 # Below this an account is spent, and headroom comparisons between two spent
 # accounts compare noise (a point is under ten minutes of work, less than two
 # poll intervals). When EVERY candidate is down here, rank by reset instead —
@@ -1987,8 +1996,16 @@ class AutoSwitchEngine:
         # below is what stops that band parking the engine. A ratio floor used
         # to sit here too and inverted monotonicity; removing it is what let
         # the fallback do the job.
+        # Weighted, because this asks whether the FLEET has anything worth
+        # having and a point of a large seat is more work than a point of a
+        # small one. Above the threshold an account's headroom IS its reserve:
+        # the quota between its limit and exhaustion.
         best_candidate_headroom = max(
-            (h for h in map(headroom.get, oauth_candidates) if h is not None),
+            (
+                h * self._weights.get(num, 1.0)
+                for num in oauth_candidates
+                if (h := headroom.get(num)) is not None
+            ),
             default=0.0,
         )
         active_recovery_ts = (
@@ -2052,13 +2069,30 @@ class AutoSwitchEngine:
                     # deciding it once, globally, from four scattered gates.
                     # Set and read under the same `all_above and trigger`
                     # condition, so it is always assigned before the key below.
+                    # Reserve, not raw percentage: one point of a 5x seat is
+                    # five points of work, and the escape is spending reserve.
+                    weighted_h = h * self._weights.get(num, 1.0)
+                    weighted_active = (active_headroom or 0.0) * self._weights.get(
+                        current, 1.0
+                    )
                     by_recovery = _recovery_is_useful(
                         recovery_ts,
                         active_recovery_ts,
-                        active_headroom or 0.0,
+                        weighted_active,
                         best_candidate_headroom,
                         now,
                     )
+                    if by_runway and weighted_h < ESCAPE_MIN_RESERVE_PCT:
+                        # Too little to be worth the switch on its own, but
+                        # better than nowhere if nothing else qualifies.
+                        #
+                        # Scoped to `runway`, whose whole objective is staying
+                        # able to work. The other strategies keep upstream's
+                        # behaviour of taking any account with reserve above
+                        # zero, which the flap guards below were measured
+                        # against.
+                        fallback.append(((1, recovery_ts, -weighted_h), num))
+                        continue
                     if by_recovery:
                         # Hysteresis on the axis we actually rank by. It bounds
                         # the flap RATE rather than making a reverse move
@@ -2072,14 +2106,14 @@ class AutoSwitchEngine:
                         # burns down to a quarter of what it beat can qualify
                         # in reverse. That takes a 4x relative burn instead of
                         # the one point a strictly-greater test would need.
-                        if h < (active_headroom or 0.0) * HORIZON_HEADROOM_RATIO:
+                        if weighted_h < weighted_active * HORIZON_HEADROOM_RATIO:
                             if (
-                                (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
-                                and h >= (active_headroom or 0.0)
+                                weighted_active <= SPENT_HEADROOM_PCT
+                                and weighted_h >= weighted_active
                                 and recovery_ts
                                 < active_recovery_ts - RECOVERY_HYSTERESIS_S
                             ):
-                                fallback.append(((0, recovery_ts, -h), num))
+                                fallback.append(((0, recovery_ts, -weighted_h), num))
                             continue
                 elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
@@ -2134,8 +2168,22 @@ class AutoSwitchEngine:
                 # whichever came first in the list. Headroom still decides
                 # first within the tier; the reset only breaks its ties, where
                 # sooner is plainly better than lower slot number.
+                # Under `runway`, recovery is bucketed at the hysteresis
+                # width, so two accounts returning within five minutes of each
+                # other are treated as returning together and the larger
+                # reserve decides. Raw timestamps let a seconds-apart reset win
+                # with a reserve that serves for a fraction of the time. The
+                # other strategies keep the exact timestamp ordering their flap
+                # guards were measured against.
+                first = (
+                    int(recovery_ts // RECOVERY_HYSTERESIS_S)
+                    if by_runway
+                    else recovery_ts
+                )
                 key: tuple = (
-                    (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
+                    (0, first, -weighted_h)
+                    if by_recovery
+                    else (1, -weighted_h, recovery_ts)
                 )
             elif consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
