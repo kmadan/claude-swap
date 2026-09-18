@@ -87,6 +87,17 @@ class AutoSwitchSettings:
     # 1.0 would move on any improvement and flap between near-equal
     # accounts. Read only by the `runway` strategy.
     runway_margin: float = 2.0
+    # How many points of a 5-hour window one point of a weekly window is worth.
+    # The two windows meter the same tokens against different totals, so a
+    # percentage of one is not a percentage of the other, and a reserve of "3"
+    # on a week is far more work than a reserve of "3" on a five-hour window.
+    # Measurable directly: while an account is active both windows rise, and
+    # the ratio of the two slopes is this number.
+    window_ratio: float = 8.5
+    # Points of a 5-hour window consumed per minute under load, used only to
+    # ask whether a reserve can carry the session until the next account
+    # returns to rotation. Nothing else depends on it.
+    burn_rate: float = 0.8
 
 
 @dataclass(frozen=True)
@@ -181,6 +192,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "runwayMargin", "runway_margin", "float", 1.05, 10.0,
             help="How many times the active account's runway a candidate needs",
+        ),
+        SettingSpec(
+            "autoswitch", "windowRatio", "window_ratio", "float", 1.0, 100.0,
+            help="5h points per weekly point, so reserves compare in one unit",
+        ),
+        SettingSpec(
+            "autoswitch", "burnRate", "burn_rate", "float", 0.01, 100.0,
+            help="5h points consumed per minute, for bridging a rotation gap",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

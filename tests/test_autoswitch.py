@@ -4643,8 +4643,8 @@ class TestHorizonAxisDoesNotFlap:
             settings=AutoSwitchSettings(),
             now=harness.clock.now,
         )
-        unbarred, _, _ = harness.engine._rank_candidates(no_return=None, **args)
-        barred, _, _ = harness.engine._rank_candidates(no_return="1", **args)
+        unbarred, _, _, _ = harness.engine._rank_candidates(no_return=None, **args)
+        barred, _, _, _ = harness.engine._rank_candidates(no_return="1", **args)
 
         assert list(unbarred) == ["1"], (
             f"premise: account 1 holds 60 points against an active on 4 and "
@@ -7336,8 +7336,8 @@ class TestRunwayEscape:
             "seven_day": {"pct": 50.0, "resets_at": _iso_at(h.clock.now + 5 * 86400.0)},
         }
 
-    def test_a_larger_seats_reserve_wins_a_shared_recovery_window(self, temp_home):
-        """Both return within five minutes; the one with more work wins.
+    def test_a_larger_seats_reserve_wins_when_neither_covers_the_gap(self, temp_home):
+        """An hour of gap is beyond any 5h reserve, so the most work wins.
 
         #2 holds 3 points on a standard seat, #3 holds 2 on a 5x seat, which is
         ten points of work. Ranked on raw percentages #2 would win.
@@ -7351,16 +7351,59 @@ class TestRunwayEscape:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
-    def test_a_sooner_recovery_still_wins_a_separate_window(self, temp_home):
-        """Bucketing must not flatten genuinely different return times."""
+    def test_a_sooner_recovery_wins_when_both_cover_the_gap(self, temp_home):
+        """Among accounts that remove the gap, take the cheapest to spend.
+
+        The gap is six minutes, which both reserves cover, so the one whose own
+        window comes back soonest is preferred: its reserve is the one that
+        regenerates first.
+        """
         h = self._harness(temp_home, account_weights="3:5")
         outcome = h.tick_with_usage({
-            "1": self._at_limit(96.0, 4.0, h),
-            "2": self._at_limit(97.0, 0.2, h),
-            "3": self._at_limit(98.0, 3.0, h),
+            "1": self._at_limit(99.0, 4.0, h),
+            "2": self._at_limit(94.0, 0.1, h),
+            "3": self._at_limit(94.0, 0.5, h),
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+    def test_a_weekly_reserve_outranks_a_larger_five_hour_one(self, temp_home):
+        """The units case, and the reason it matters.
+
+        #2 shows 6 points left on its 5h window and #3 shows 3 on its week.
+        The raw numbers favour #2, but a weekly point is worth about 8.5
+        five-hour points, so #3 holds roughly four times the work and is the
+        only one that can cover the 24-minute gap until #2 returns.
+        """
+        h = self._harness(temp_home)
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        outcome = h.tick_with_usage({
+            "1": self._at_limit(99.0, 3.0, h),
+            "2": self._at_limit(94.0, 0.4, h),
+            "3": {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 97.0, "resets_at": d(0.9)},
+            },
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_it_stays_when_where_it_is_can_cover_the_gap(self, temp_home):
+        """A move that buys nothing still costs a credential pickup."""
+        h = self._harness(temp_home)
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        outcome = h.tick_with_usage({
+            # The active account holds a weekly reserve worth ~25 units, far
+            # more than the ~5 units the two-minute gap needs.
+            "1": {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 97.0, "resets_at": d(0.9)},
+            },
+            "2": self._at_limit(94.0, 0.03, h),
+            "3": self._at_limit(94.0, 1.0, h),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
 
     def test_a_reserve_too_thin_to_use_is_not_worth_a_switch(self, temp_home):
         """#2 returns soonest but offers one point; #3 offers four."""
@@ -7380,6 +7423,54 @@ class TestRunwayEscape:
             "1": self._at_limit(95.0, 4.0, h),
             "2": self._at_limit(99.0, 1.0, h),
             "3": self._at_limit(99.0, 3.0, h),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+
+class TestAmberToGreenIsTakenImmediately:
+    """An account back under its limit is taken while sitting on a used one.
+
+    The path, and why it does not depend on the escape at all: an active
+    account past its limit gives a `proactive` trigger, and the landing-health
+    gate then admits only accounts under their limit, so the returning account
+    is the only candidate. `_every_account_above_threshold` also goes false the
+    moment one account is healthy, which switches the escape off entirely.
+    """
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="runway", cooldown_seconds=0.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_it_moves_to_the_account_that_came_back(self, temp_home):
+        h = self._harness(temp_home)
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        blocked = {
+            "1": _usage7(95, 50, d(5)),   # active, past its 5h limit
+            "2": _usage7(99, 20, d(4)),   # also past it: nothing to move to
+        }
+        assert h.tick_with_usage(blocked) is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+        recovered = dict(blocked, **{"2": _usage7(0, 20, d(4))})
+        assert h.tick_with_usage(recovered) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_returning_account_outranks_a_reserve(self, temp_home):
+        """Even a large reserve loses to an account under its limit.
+
+        Reserve is what the escape spends when there is no alternative; once
+        there is one, spending reserve is the worse trade whatever its size.
+        """
+        h = self._harness(temp_home)
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95, 50, d(5)),
+            # Under its 5h limit, so a legitimate target, with a thin week.
+            "2": _usage7(10, 88, d(6)),
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2

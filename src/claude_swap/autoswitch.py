@@ -162,14 +162,14 @@ HORIZON_HEADROOM_RATIO = 2.0
 # noise.
 RUNWAY_MARGIN_RATIO = 2.0
 
-# Least weighted reserve worth a switch during the at-limit escape. Every
-# switch costs a credential pickup and interrupts whatever is running, so
-# landing on an account that can serve for seconds is worse than staying put
-# and waiting for the next reset. Two points against the measured burn of
-# roughly 0.8 points a minute is about two and a half minutes of work. A
-# candidate below the floor is not discarded: it goes to the one-way fallback
-# and is taken only when nothing else qualifies.
-ESCAPE_MIN_RESERVE_PCT = 2.0
+# Least reserve worth a switch during the at-limit escape, in units of one
+# 5-hour point (see ``_reserve_units``). Every switch costs a credential pickup
+# and interrupts whatever is running, so landing on an account that can serve
+# for seconds is worse than staying put. Four units against a burn of roughly
+# 0.8 points a minute is about five minutes of work. A candidate below the
+# floor is not discarded: it goes to the one-way fallback and is taken only
+# when nothing else qualifies.
+ESCAPE_MIN_RESERVE_UNITS = 4.0
 
 # Below this an account is spent, and headroom comparisons between two spent
 # accounts compare noise (a point is under ten minutes of work, less than two
@@ -670,6 +670,35 @@ def _weekly_runway(
     # a landing target until its window resets.
     usable = max(0.0, limit - float(window["pct"]))
     return weight * usable / days
+
+
+def _reserve_units(
+    usage: dict | str | None,
+    models: Sequence[str],
+    weight: float,
+    window_ratio: float,
+) -> float:
+    """Reserve on the binding window, in units of one 5-hour point.
+
+    Above the threshold an account's headroom is its reserve: the quota between
+    its limit and exhaustion, which the at-limit escape is there to spend. Two
+    conversions are needed before reserves from different accounts can be
+    compared at all.
+
+    The first is the seat: a point of a 5x seat is five points of work. The
+    second is the window, and it was missing. A weekly window and a 5-hour
+    window meter the same tokens against different totals, so a reserve of 3
+    points on a week is worth ``window_ratio`` times a reserve of 3 points on
+    a five-hour window. Measured on this fleet at about 8.5, which makes "6
+    points left on the 5h" less than a quarter of the work in "3 points left
+    on the week", where the raw numbers say the opposite.
+    """
+    windows = list(oauth.relevant_windows(usage, models, weight))
+    if not windows:
+        return 0.0
+    label, pct, _resets_at = max(windows, key=lambda w: w[1])
+    reserve = max(0.0, 100.0 - pct) * weight
+    return reserve if label == "5h" else reserve * window_ratio
 
 
 def _every_account_above_threshold(
@@ -1313,7 +1342,7 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
-        ordered, any_known, active_reset_ts = _rank(
+        ordered, any_known, active_reset_ts, held_on_active = _rank(
             trigger=trigger,
             consume_first=consume_first,
             by_runway=by_runway,
@@ -1345,7 +1374,7 @@ class AutoSwitchEngine:
             headroom = _headroom_by_account(usage, self._models, self._weights)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
-            ordered, any_known, active_reset_ts = _rank(
+            ordered, any_known, active_reset_ts, held_on_active = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
                 by_runway=by_runway,
@@ -1378,6 +1407,17 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
+            if held_on_active:
+                # The active account's own reserve reaches the moment the fleet
+                # next has a target, so there is nothing to gain by moving and
+                # a switch to spend.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="bridging-on-active",
+                        detail="active account's reserve covers the gap",
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if trigger == "runway":
                 # Below the threshold and healthy, with nothing offering
                 # materially more runway. Staying is the right answer, and
@@ -2008,6 +2048,51 @@ class AutoSwitchEngine:
             ),
             default=0.0,
         )
+        # When the fleet next has something under its limit again, and what it
+        # would take to work until then. A reserve that cannot reach that
+        # moment leaves a gap however soon it regenerates; one that can reach
+        # it makes the gap disappear. Only the runway strategy asks.
+        gap_units = 0.0
+        active_units = 0.0
+        if all_above and by_runway:
+            returns = [
+                _binding_recovery_ts(
+                    usage.get(num), self._models, now, self._weights.get(num, 1.0)
+                )
+                for num in (current, *oauth_candidates)
+            ]
+            soonest = min((ts for ts in returns if ts != float("inf")), default=None)
+            if soonest is not None:
+                minutes = max(0.0, (soonest - now) / 60.0)
+                gap_units = minutes * settings.burn_rate
+            active_units = _reserve_units(
+                usage.get(current),
+                self._models,
+                self._weights.get(current, 1.0),
+                settings.window_ratio,
+            )
+            # The best a move could offer, on both axes that matter: work
+            # available now, and when that work comes back.
+            best_units = 0.0
+            best_return = float("inf")
+            for num in oauth_candidates:
+                if (headroom.get(num) or 0.0) <= 0:
+                    continue
+                best_units = max(
+                    best_units,
+                    _reserve_units(
+                        usage.get(num),
+                        self._models,
+                        self._weights.get(num, 1.0),
+                        settings.window_ratio,
+                    ),
+                )
+                best_return = min(
+                    best_return,
+                    _binding_recovery_ts(
+                        usage.get(num), self._models, now, self._weights.get(num, 1.0)
+                    ),
+                )
         active_recovery_ts = (
             _binding_recovery_ts(
                 usage.get(current), self._models, now, self._weights.get(current, 1.0)
@@ -2019,6 +2104,9 @@ class AutoSwitchEngine:
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
         any_known = False
+        # Set when the active account's own reserve covers the gap, so the
+        # caller can report a deliberate hold rather than a blocked fleet.
+        held_on_active = False
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
@@ -2072,6 +2160,16 @@ class AutoSwitchEngine:
                     # Reserve, not raw percentage: one point of a 5x seat is
                     # five points of work, and the escape is spending reserve.
                     weighted_h = h * self._weights.get(num, 1.0)
+                    cand_units = (
+                        _reserve_units(
+                            usage.get(num),
+                            self._models,
+                            self._weights.get(num, 1.0),
+                            settings.window_ratio,
+                        )
+                        if by_runway
+                        else 0.0
+                    )
                     weighted_active = (active_headroom or 0.0) * self._weights.get(
                         current, 1.0
                     )
@@ -2082,17 +2180,57 @@ class AutoSwitchEngine:
                         best_candidate_headroom,
                         now,
                     )
-                    if by_runway and weighted_h < ESCAPE_MIN_RESERVE_PCT:
-                        # Too little to be worth the switch on its own, but
-                        # better than nowhere if nothing else qualifies.
-                        #
-                        # Scoped to `runway`, whose whole objective is staying
-                        # able to work. The other strategies keep upstream's
-                        # behaviour of taking any account with reserve above
-                        # zero, which the flap guards below were measured
-                        # against.
-                        fallback.append(((1, recovery_ts, -weighted_h), num))
-                        continue
+                    if by_runway:
+                        if active_units >= gap_units > 0.0 or (
+                            active_units >= best_units
+                            and active_recovery_ts
+                            <= best_return + RECOVERY_HYSTERESIS_S
+                        ):
+                            # Nothing to gain by moving. Either the account we
+                            # are on can work until the fleet has a target
+                            # again, or it offers at least as much work as any
+                            # candidate AND comes back no later, which is the
+                            # pair of axes a move could improve. Holding also
+                            # keeps the one-way fallback below from taking a
+                            # thinner account merely because nothing qualified.
+                            held_on_active = True
+                            continue
+                        if cand_units < ESCAPE_MIN_RESERVE_UNITS:
+                            # Too little to be worth the switch on its own, but
+                            # better than nowhere if nothing else qualifies.
+                            #
+                            # Scoped to `runway`, whose objective is staying
+                            # able to work. The other strategies keep
+                            # upstream's behaviour of taking any account with
+                            # reserve above zero, which the flap guards below
+                            # were measured against.
+                            fallback.append(((1, recovery_ts, -cand_units), num))
+                            continue
+                        if cand_units >= gap_units > 0.0:
+                            # It can work until the fleet has a target again
+                            # and the account we are on cannot, so taking it
+                            # removes the gap outright. That outranks returning
+                            # sooner, and it deliberately bypasses the recovery
+                            # hysteresis below, which refuses any candidate
+                            # that returns later than where we are: a weekly
+                            # reserve always returns later, and is the only
+                            # reserve large enough to cover a gap of any
+                            # length.
+                            #
+                            # It cannot flap. Once landed, that account is the
+                            # active one and covers the gap, so the clause
+                            # above holds the engine there.
+                            qualifying.append(
+                                (
+                                    (
+                                        0,
+                                        int(recovery_ts // RECOVERY_HYSTERESIS_S),
+                                        -cand_units,
+                                    ),
+                                    num,
+                                )
+                            )
+                            continue
                     if by_recovery:
                         # Hysteresis on the axis we actually rank by. It bounds
                         # the flap RATE rather than making a reverse move
@@ -2168,23 +2306,17 @@ class AutoSwitchEngine:
                 # whichever came first in the list. Headroom still decides
                 # first within the tier; the reset only breaks its ties, where
                 # sooner is plainly better than lower slot number.
-                # Under `runway`, recovery is bucketed at the hysteresis
-                # width, so two accounts returning within five minutes of each
-                # other are treated as returning together and the larger
-                # reserve decides. Raw timestamps let a seconds-apart reset win
-                # with a reserve that serves for a fraction of the time. The
-                # other strategies keep the exact timestamp ordering their flap
-                # guards were measured against.
-                first = (
-                    int(recovery_ts // RECOVERY_HYSTERESIS_S)
-                    if by_runway
-                    else recovery_ts
-                )
-                key: tuple = (
-                    (0, first, -weighted_h)
-                    if by_recovery
-                    else (1, -weighted_h, recovery_ts)
-                )
+                if by_runway:
+                    # Reached only by candidates that cannot cover the gap: the
+                    # ones that can were taken above. Ranked by how much of it
+                    # they can cover, since none of them ends it.
+                    key: tuple = (1, -cand_units, recovery_ts)
+                else:
+                    key = (
+                        (0, recovery_ts, -weighted_h)
+                        if by_recovery
+                        else (1, -weighted_h, recovery_ts)
+                    )
             elif consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
@@ -2207,7 +2339,12 @@ class AutoSwitchEngine:
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
-        return [num for _, num in qualifying], any_known, active_reset_ts
+        return (
+            [num for _, num in qualifying],
+            any_known,
+            active_reset_ts,
+            held_on_active,
+        )
 
     # -- adaptive usage scheduling ---------------------------------------------
 
