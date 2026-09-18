@@ -7077,10 +7077,18 @@ class TestWeeklyRunway:
         assert fresh > spent
 
     def test_points_per_day(self):
-        assert _weekly_runway(self._usage(30.0, 7.0), self.NOW) == pytest.approx(10.0)
+        """60 usable points (30 used, limit 90) over 7 days."""
+        assert _weekly_runway(self._usage(30.0, 7.0), self.NOW) == pytest.approx(
+            60.0 / 7.0
+        )
+
+    def test_past_its_limit_there_is_no_runway(self):
+        """The reserve above the limit is never spent, so it is not runway."""
+        assert _weekly_runway(self._usage(95.0, 3.0), self.NOW) == 0.0
 
     def test_an_imminent_reset_rates_highest(self):
-        assert _weekly_runway(self._usage(95.0, 1 / 24), self.NOW) > _weekly_runway(
+        """5 usable points that vanish in an hour beat a whole fresh week."""
+        assert _weekly_runway(self._usage(85.0, 1 / 24), self.NOW) > _weekly_runway(
             self._usage(0.0, 7.0), self.NOW
         )
 
@@ -7116,14 +7124,16 @@ class TestAccountWeights:
             base * 5
         )
 
-    def test_a_large_seat_near_its_limit_can_outrank_a_small_fresh_one(self):
+    def test_a_large_seat_near_its_limit_can_outrank_a_small_fresh_one(self, monkeypatch):
         """The case the ratio exists for.
 
-        13 points of a seat holding five times as much is 65 points of work,
-        against 96 on the small seat, and they expire in less than half the
-        time. Unweighted the comparison inverts, which is the error the weight
+        With 7d:97 configured, the 5x seat is judged at 99, so at 87% used it
+        still has 12 usable points, which is 60 points of work against the
+        small seat's 93. They expire in less than half the time, so its rate is
+        higher. Unweighted the comparison inverts, which is the error the weight
         removes.
         """
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: ({"7d": 97.0}, 90.0))
         large = _weekly_runway(self._usage(87.0, 2.9), self.NOW, 5.0)
         small = _weekly_runway(self._usage(4.0, 6.9), self.NOW, 1.0)
         assert large > small
@@ -7139,12 +7149,12 @@ class TestAccountWeights:
         h.seed(3, "c@example.com")
         h.make_live("a@example.com", 1)
         d = lambda n: _iso_at(h.clock.now + n * 86400.0)
-        # #2 holds 60 points over 3 days (20/day). #3 holds 15 over 3 days, but
-        # its seat is five times the size, so 25/day.
+        # #2 has 50 usable points over 3 days (16.7/day). #3 has 20, but on a
+        # seat five times the size, so 33/day.
         outcome = h.tick_with_usage({
             "1": _usage7(95, 50, d(5)),
-            "2": _usage7(10, 40, d(3)),
-            "3": _usage7(10, 85, d(3)),
+            "2": _usage7(10, 40, d(3)),    # 50 usable points over 3 days
+            "3": _usage7(10, 70, d(3)),    # 20 usable, but on a 5x seat
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
@@ -7158,8 +7168,8 @@ class TestAccountWeights:
         d = lambda n: _iso_at(h.clock.now + n * 86400.0)
         outcome = h.tick_with_usage({
             "1": _usage7(95, 50, d(5)),
-            "2": _usage7(10, 40, d(3)),
-            "3": _usage7(10, 85, d(3)),
+            "2": _usage7(10, 40, d(3)),    # 50 usable points over 3 days
+            "3": _usage7(10, 70, d(3)),    # 20 usable, but on a 5x seat
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
@@ -7179,12 +7189,12 @@ class TestLiveSettings:
     @staticmethod
     def _fleet(h: EngineHarness) -> dict:
         d = lambda n: _iso_at(h.clock.now + n * 86400.0)
-        # #2: 60 points over 3 days. #3: 15 points over 3 days, on a seat five
-        # times the size, so 25/day once the weight is declared.
+        # #2: 50 usable points over 3 days. #3: 20 usable, on a seat five times
+        # the size, so 33/day once the weight is declared.
         return {
             "1": _usage7(95, 50, d(5)),
-            "2": _usage7(10, 40, d(3)),
-            "3": _usage7(10, 85, d(3)),
+            "2": _usage7(10, 40, d(3)),    # 50 usable points over 3 days
+            "3": _usage7(10, 70, d(3)),    # 20 usable, but on a 5x seat
         }
 
     def test_a_changed_setting_lands_on_the_next_tick(self, temp_home):

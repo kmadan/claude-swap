@@ -626,6 +626,16 @@ def _weekly_runway(
     that reads only the denominator, which is why it picks an account with
     three points left over one with a hundred whenever the three reset sooner.
 
+    Headroom is measured to the account's own weekly *limit*, not to
+    exhaustion. The engine will not land on an account at or over its limit,
+    and it steps off the active account at the same point, so the quota between
+    the limit and 100 is a reserve that never gets spent. Counting it would
+    overstate every account's runway, and overstate it most for the accounts
+    closest to their limit, which is exactly where the ranking is decided. The
+    limit is the configured one for the weekly window, scaled for this seat, or
+    ``autoswitch.threshold`` when no per-window limit is set, which is what the
+    comparison falls back to in :func:`oauth.effective_pct`.
+
     ``weight`` is that account's capacity relative to the others
     (``autoswitch.accountWeights``), which is what makes a comparison across
     accounts meaningful: a percentage is reported against each account's own
@@ -642,7 +652,15 @@ def _weekly_runway(
     days = (ts - now) / 86400.0
     if days <= 0:
         return None
-    return weight * (100.0 - float(window["pct"])) / days
+    limits, threshold = oauth.window_thresholds()
+    configured = limits.get("7d")
+    limit = (
+        oauth.scaled_limit(configured, weight) if configured is not None else threshold
+    )
+    # An account already past its limit has no usable runway at all; it is not
+    # a landing target until its window resets.
+    usable = max(0.0, limit - float(window["pct"]))
+    return weight * usable / days
 
 
 def _every_account_above_threshold(
