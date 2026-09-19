@@ -396,15 +396,21 @@ class SwitchEvent(AutoSwitchEvent):
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
     dry_run: bool = False
+    # Why this account and not another, in a few words. Additive: absent from
+    # the JSON when the ranking had nothing to explain.
+    note: str = ""
 
     def _fields(self) -> dict:
-        return {
+        fields = {
             "trigger": self.trigger,
             "from": self.from_ref,
             "to": self.to_ref,
             "warnings": self.warnings,
             "dryRun": self.dry_run,
         }
+        if self.note:
+            fields["note"] = self.note
+        return fields
 
     def human(self) -> str:
         src = (
@@ -416,7 +422,9 @@ class SwitchEvent(AutoSwitchEvent):
             else "?"
         )
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
-        return f"{prefix} {src} -> {dst} ({self.trigger})"
+        tail = f" ({self.trigger}"
+        tail += f": {self.note})" if self.note else ")"
+        return f"{prefix} {src} -> {dst}{tail}"
 
 
 @dataclass(frozen=True)
@@ -670,6 +678,20 @@ def _weekly_runway(
     # a landing target until its window resets.
     usable = max(0.0, limit - float(window["pct"]))
     return weight * usable / days
+
+
+def _clock_started(usage: dict | str | None) -> bool:
+    """Whether this account's 5-hour window has started.
+
+    The window opens on the first inference request and resets five hours
+    later, so an account nothing has run on reports no ``resets_at`` at all.
+    Until something starts it, it schedules no refresh: permanently available
+    and permanently sterile.
+    """
+    if not isinstance(usage, dict):
+        return True  # unknown: treat as running rather than invent a refresh
+    window = usage.get("five_hour")
+    return not isinstance(window, dict) or bool(window.get("resets_at"))
 
 
 def _reserve_units(
@@ -1342,7 +1364,7 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
-        ordered, any_known, active_reset_ts, held_on_active = _rank(
+        ordered, any_known, active_reset_ts, held_on_active, gap_units = _rank(
             trigger=trigger,
             consume_first=consume_first,
             by_runway=by_runway,
@@ -1374,7 +1396,7 @@ class AutoSwitchEngine:
             headroom = _headroom_by_account(usage, self._models, self._weights)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
-            ordered, any_known, active_reset_ts, held_on_active = _rank(
+            ordered, any_known, active_reset_ts, held_on_active, gap_units = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
                 by_runway=by_runway,
@@ -1540,10 +1562,11 @@ class AutoSwitchEngine:
                         )
                     )
                     return TickOutcome.NO_ACTION
+            note = self._switch_note(num, usage, settings, decided_now, gap_units)
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(num, email, trigger, left_snapshot, note)
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1574,7 +1597,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(num, email, trigger, left_snapshot, note)
 
         if systemic or transient_failure:
             self._emit(
@@ -2101,6 +2124,23 @@ class AutoSwitchEngine:
             else 0.0  # unread unless all_above; never a live sentinel
         )
 
+        # Best runway among candidates that could actually be landed on. The tie
+        # band is measured against it: inside the band two accounts are near
+        # enough equal on weekly budget that the 5-hour axis can decide instead.
+        best_runway = 0.0
+        if by_runway and not all_above:
+            for cand in oauth_candidates:
+                cand_h = headroom.get(cand)
+                if cand_h is None or cand_h <= 0:
+                    continue
+                if (100.0 - cand_h) >= settings.threshold:
+                    continue
+                value = _weekly_runway(
+                    usage.get(cand), now, self._weights.get(cand, 1.0)
+                )
+                if value is not None:
+                    best_runway = max(best_runway, value)
+
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
         any_known = False
@@ -2344,7 +2384,23 @@ class AutoSwitchEngine:
                 # away outranks both. An account whose weekly window or reset
                 # cannot be read sorts last rather than being treated as
                 # infinite runway, with binding headroom breaking ties.
+                # Within `runway_tie_band` of the best, the weekly budgets are
+                # near enough to equal that the 5-hour axis decides, and there
+                # the account with no clock running wins: working on it starts
+                # its window, which pins its next refresh earlier and gives the
+                # fleet one more cycle. Priming is only ever a by-product of
+                # routing real work, so it stays a tie-break; outside the band
+                # the weekly figure decides, being the resource that costs days
+                # rather than hours when it runs out.
+                tied = (
+                    cand_runway is not None
+                    and settings.runway_tie_band > 0.0
+                    and cand_runway >= best_runway * (1.0 - settings.runway_tie_band)
+                )
+                primes = tied and not _clock_started(usage.get(num))
                 key = (
+                    0 if tied else 1,
+                    0 if primes else 1,
                     -cand_runway if cand_runway is not None else float("inf"),
                     -h,
                 )
@@ -2359,6 +2415,7 @@ class AutoSwitchEngine:
             any_known,
             active_reset_ts,
             held_on_active,
+            gap_units,
         )
 
     # -- adaptive usage scheduling ---------------------------------------------
@@ -2519,12 +2576,46 @@ class AutoSwitchEngine:
         headroom = _headroom_by_account(usage, self._models, self._weights)
         return entries, usage, headroom
 
+    def _switch_note(
+        self,
+        num: str,
+        usage: dict,
+        settings: AutoSwitchSettings,
+        now: float,
+        gap_units: float = 0.0,
+    ) -> str:
+        """Why this account, in a few words, for the log and the JSON event.
+
+        Recomputed from the same inputs the ranking read rather than carried
+        out of it, so a note can never describe a decision that was not made.
+        Empty for strategies whose choice needs no explaining.
+        """
+        if settings.strategy != "runway":
+            return ""
+        weight = self._weights.get(num, 1.0)
+        parts = []
+        runway = _weekly_runway(usage.get(num), now, weight)
+        if runway is not None:
+            parts.append(f"{runway:.1f} weekly pts/day")
+        if gap_units > 0.0:
+            units = _reserve_units(
+                usage.get(num), self._models, weight, settings.window_ratio
+            )
+            if units >= gap_units:
+                parts.append(f"reserve {units:.0f}u covers the {gap_units:.0f}u gap")
+            else:
+                parts.append(f"reserve {units:.0f}u, most available")
+        elif not _clock_started(usage.get(num)):
+            parts.append("starts its 5h clock")
+        return ", ".join(parts)
+
     def _perform(
         self,
         number: str,
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        note: str = "",
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2532,6 +2623,7 @@ class AutoSwitchEngine:
             self._emit(
                 SwitchEvent(
                     trigger=trigger,
+                    note=note,
                     from_ref=_ref(current, current_email) if current else None,
                     to_ref=_ref(number, email),
                     dry_run=True,
@@ -2587,6 +2679,7 @@ class AutoSwitchEngine:
         self._emit(
             SwitchEvent(
                 trigger=trigger,
+                note=note,
                 from_ref=result.get("from"),
                 to_ref=result.get("to"),
                 warnings=result.get("warnings", []),

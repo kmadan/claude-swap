@@ -4643,8 +4643,8 @@ class TestHorizonAxisDoesNotFlap:
             settings=AutoSwitchSettings(),
             now=harness.clock.now,
         )
-        unbarred, _, _, _ = harness.engine._rank_candidates(no_return=None, **args)
-        barred, _, _, _ = harness.engine._rank_candidates(no_return="1", **args)
+        unbarred, *_ = harness.engine._rank_candidates(no_return=None, **args)
+        barred, *_ = harness.engine._rank_candidates(no_return="1", **args)
 
         assert list(unbarred) == ["1"], (
             f"premise: account 1 holds 60 points against an active on 4 and "
@@ -7508,7 +7508,7 @@ class TestBarredAccountIsALastResort:
 
     def test_the_barred_account_is_taken_when_it_is_the_only_target(self, temp_home):
         h = EngineHarness(temp_home, strategy="runway")
-        ordered, _, _, _ = h.engine._rank_candidates(
+        ordered, *_ = h.engine._rank_candidates(
             no_return="2", **self._args(h, 95.0, 12.0)
         )
         assert ordered == ["2"]
@@ -7520,7 +7520,7 @@ class TestBarredAccountIsALastResort:
         args["usage"]["3"] = _usage7(5, 30, d(5))
         args["headroom"]["3"] = oauth.account_headroom(args["usage"]["3"])
         args["oauth_candidates"] = ["2", "3"]
-        ordered, _, _, _ = h.engine._rank_candidates(no_return="2", **args)
+        ordered, *_ = h.engine._rank_candidates(no_return="2", **args)
         assert ordered == ["3"]
 
     def test_the_bar_holds_for_a_below_threshold_nudge(self, temp_home):
@@ -7529,12 +7529,108 @@ class TestBarredAccountIsALastResort:
         args = self._args(h, 20.0, 12.0)
         args["trigger"] = "runway"
         args["active_headroom"] = args["headroom"]["1"]
-        ordered, _, _, _ = h.engine._rank_candidates(no_return="2", **args)
+        ordered, *_ = h.engine._rank_candidates(no_return="2", **args)
         assert ordered == []
 
     def test_other_strategies_keep_the_bar_absolute(self, temp_home):
         h = EngineHarness(temp_home, strategy="best")
         args = self._args(h, 95.0, 12.0)
         args["by_runway"] = False
-        ordered, _, _, _ = h.engine._rank_candidates(no_return="2", **args)
+        ordered, *_ = h.engine._rank_candidates(no_return="2", **args)
         assert ordered == []
+
+
+class TestRunwayTieBand:
+    """Within the band the 5-hour clock decides; outside it the week does."""
+
+    def _harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="runway", **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    @staticmethod
+    def _unstarted(pct7: float, days: float, h: EngineHarness) -> dict:
+        """Nothing has run on this account: its 5h window has no reset."""
+        return {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {
+                "pct": pct7,
+                "resets_at": _iso_at(h.clock.now + days * 86400.0),
+            },
+        }
+
+    @staticmethod
+    def _started(pct5: float, pct7: float, days: float, h: EngineHarness) -> dict:
+        """Worked on already: its 5h window carries a reset."""
+        return {
+            "five_hour": {
+                "pct": pct5,
+                "resets_at": _iso_at(h.clock.now + 3 * 3600.0),
+            },
+            "seven_day": {
+                "pct": pct7,
+                "resets_at": _iso_at(h.clock.now + days * 86400.0),
+            },
+        }
+
+    def _fleet(self, h: EngineHarness, spread: float) -> dict:
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        return {
+            "1": _usage7(95, 50, d(5)),                      # active, must leave
+            "2": self._started(30, 62 - spread, 5.0, h),     # clock running
+            "3": self._unstarted(62, 5.0, h),                # clock not started
+        }
+
+    def test_a_tie_starts_the_unstarted_clock(self, temp_home):
+        """Equal weekly budgets, so the free cycle decides."""
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self._fleet(h, 0.0)) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_a_real_weekly_difference_still_wins(self, temp_home):
+        """20 points clear of the band: the week is worth more than a cycle."""
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self._fleet(h, 20.0)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_the_band_can_be_disabled(self, temp_home):
+        h = self._harness(temp_home, runway_tie_band=0.0)
+        # A hair of weekly advantage now decides, since nothing is ever tied.
+        assert h.tick_with_usage(self._fleet(h, 1.0)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_wider_band_takes_a_wider_difference_as_tied(self, temp_home):
+        h = self._harness(temp_home, runway_tie_band=0.5)
+        assert h.tick_with_usage(self._fleet(h, 20.0)) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_the_switch_says_why(self, temp_home):
+        """The log has to carry the rationale, not just the destination."""
+        h = self._harness(temp_home)
+        h.tick_with_usage(self._fleet(h, 0.0))
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert "starts its 5h clock" in sw.note
+        assert "weekly pts/day" in sw.note
+        assert sw.note in sw.human()
+        assert sw.to_json()["note"] == sw.note
+
+    def test_a_plain_choice_says_only_its_rate(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage(self._fleet(h, 20.0))
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert "weekly pts/day" in sw.note
+        assert "clock" not in sw.note
+
+    def test_other_strategies_carry_no_note(self, temp_home):
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        h.tick_with_usage({"1": _usage7(95, 50, d(5)), "2": _usage7(5, 20, d(5))})
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.note == ""
+        assert "note" not in sw.to_json()

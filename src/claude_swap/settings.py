@@ -98,6 +98,13 @@ class AutoSwitchSettings:
     # ask whether a reserve can carry the session until the next account
     # returns to rotation. Nothing else depends on it.
     burn_rate: float = 0.8
+    # How close two accounts' runway must be to count as tied, as a fraction.
+    # Within the band the account whose 5-hour window has not started is
+    # preferred, which starts its clock and pins its next refresh earlier.
+    # Priming is only ever a by-product of routing real work, so it is a
+    # tie-break: outside the band the weekly budget decides, being the resource
+    # that costs days rather than hours when it runs out. 0 disables it.
+    runway_tie_band: float = 0.10
 
 
 @dataclass(frozen=True)
@@ -200,6 +207,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "burnRate", "burn_rate", "float", 0.01, 100.0,
             help="5h points consumed per minute, for bridging a rotation gap",
+        ),
+        SettingSpec(
+            "autoswitch", "runwayTieBand", "runway_tie_band", "float", 0.0, 0.5,
+            help="Runway within this fraction counts as tied; prefers an unstarted 5h clock",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
