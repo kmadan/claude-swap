@@ -645,7 +645,9 @@ def effective_pct(
 
 
 def relevant_windows(
-    usage: dict | None, models: Sequence[str] = ()
+    usage: dict | None,
+    models: Sequence[str] = (),
+    threshold: float | None = None,
 ) -> list[tuple[str, float, str | None]]:
     """Every ``(label, pct, resets_at)`` window that gates this account.
 
@@ -670,7 +672,15 @@ def relevant_windows(
         return []
     windows: list[tuple[str, float, str | None]] = []
     selected = decision_windows()
-    limits, threshold = window_thresholds()
+    limits, file_threshold = window_thresholds()
+    # Anchored to the threshold the CALLER compares against, not the one in
+    # settings.json. A CLI ``--threshold`` overrides the file for the engine's
+    # comparison, and a TUI session override does the same; anchoring here to
+    # the file instead restates a window below its own limit to just under the
+    # FILE's threshold, which a lower effective threshold then reads as over
+    # the line and evacuates. Reported with logs on PR #355.
+    if threshold is None:
+        threshold = file_threshold
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
         if not (isinstance(window, dict) and isinstance(window.get("pct"), (int, float))):
@@ -710,7 +720,9 @@ def relevant_windows(
 
 
 def account_headroom(
-    usage: dict | None, models: Sequence[str] = ()
+    usage: dict | None,
+    models: Sequence[str] = (),
+    threshold: float | None = None,
 ) -> float | None:
     """Remaining percentage before this account hits a rate-limit window.
 
@@ -724,7 +736,7 @@ def account_headroom(
     or carries no window data, which callers treat as "unknown" (never
     auto-skipped).
     """
-    pcts = [pct for _, pct, _ in relevant_windows(usage, models)]
+    pcts = [pct for _, pct, _ in relevant_windows(usage, models, threshold)]
     if not pcts:
         return None
     return 100.0 - max(pcts)

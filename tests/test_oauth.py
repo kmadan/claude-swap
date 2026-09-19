@@ -1703,3 +1703,40 @@ class TestWindowSettingResolution:
     def test_missing_settings_file_falls_back(self, temp_home):
         assert oauth.decision_windows() == frozenset({"5h", "7d"})
         assert oauth.window_thresholds() == ({}, 90.0)
+class TestThresholdAnchor:
+    """The restatement is anchored to the threshold the CALLER compares against.
+
+    Reported by yunjeongiya on PR #355. ``autoswitch.threshold`` in
+    settings.json is not necessarily the number in force: ``--threshold`` on
+    the command line overrides it for the engine, and a TUI session override
+    does the same. Anchoring the restatement to the file instead puts a window
+    that is below its own limit at just under the FILE's threshold, which a
+    lower effective threshold then reads as over the line.
+    """
+
+    USAGE = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 95.0}}
+
+    @pytest.fixture(autouse=True)
+    def _policy(self, monkeypatch):
+        # settings.json says 90; the caller is running with something else.
+        monkeypatch.setattr(oauth, "decision_windows", lambda: frozenset({"5h", "7d"}))
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: ({"7d": 97.0}, 90.0))
+
+    def test_the_file_anchor_is_the_default(self):
+        assert 100.0 - oauth.account_headroom(self.USAGE) < 90.0
+
+    def test_a_lower_effective_threshold_does_not_evict(self):
+        """95% of a window limited at 97 must not block, at any threshold."""
+        assert 100.0 - oauth.account_headroom(self.USAGE, (), 85.0) < 85.0
+
+    def test_a_higher_effective_threshold_does_not_evict_either(self):
+        assert 100.0 - oauth.account_headroom(self.USAGE, (), 95.0) < 95.0
+
+    @pytest.mark.parametrize("effective", [50.0, 70.0, 85.0, 90.0, 95.0, 99.0])
+    def test_under_its_limit_never_blocks_whatever_the_threshold(self, effective):
+        assert 100.0 - oauth.account_headroom(self.USAGE, (), effective) < effective
+
+    @pytest.mark.parametrize("effective", [50.0, 85.0, 90.0])
+    def test_at_its_limit_always_blocks_whatever_the_threshold(self, effective):
+        usage = dict(self.USAGE, seven_day={"pct": 97.0})
+        assert 100.0 - oauth.account_headroom(usage, (), effective) >= effective
