@@ -162,6 +162,14 @@ HORIZON_HEADROOM_RATIO = 2.0
 # noise.
 RUNWAY_MARGIN_RATIO = 2.0
 
+# How long a primed account is left alone before it may be primed again. A
+# window opens on the first inference REQUEST, so priming an account while
+# nobody is working starts nothing: the clock stays idle, the account stays a
+# prime candidate, and the engine would move to it again every cooldown for as
+# long as the machine sits idle. One attempt an hour bounds that to noise while
+# still starting the clock promptly once work resumes.
+PRIME_RETRY_S = 3600.0
+
 # Least reserve worth a switch during the at-limit escape, in units of one
 # 5-hour point (see ``_reserve_units``). Every switch costs a credential pickup
 # and interrupts whatever is running, so landing on an account that can serve
@@ -1205,6 +1213,28 @@ class AutoSwitchEngine:
                     trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
+
+            if trigger == "runway" and state.get("primingAccount") == current:
+                if _clock_started(usage.get(current)):
+                    # The window opened, so the prime is finished and normal
+                    # ranking resumes on this same tick.
+                    self._mutate_state(lambda s: s.pop("primingAccount", None))
+                else:
+                    # Switched here to start a clock, and no request has
+                    # started it yet. Moving away now would waste the switch
+                    # and leave the window exactly as idle as it was. At-limit
+                    # and failover still escape: this holds optional moves
+                    # only.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="priming",
+                            detail=(
+                                "holding here until its 5h window opens; "
+                                "the clock starts on the next request"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1308,6 +1338,18 @@ class AutoSwitchEngine:
         consume_first = settings.strategy == "consume-first"
         by_runway = settings.strategy == "runway"
 
+        # Accounts primed recently enough that another attempt would be
+        # noise. A window opens on the first REQUEST, so priming while nobody
+        # is working starts nothing; without this bound the engine would move
+        # to the same idle account every cooldown for as long as the machine
+        # sits idle.
+        stamps = state.get("primedAt")
+        primed_recently = frozenset(
+            num
+            for num, ts in (stamps if isinstance(stamps, dict) else {}).items()
+            if isinstance(ts, (int, float)) and self.clock() - ts < PRIME_RETRY_S
+        )
+
         def _rank(**kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
             the barred account is a different proposition from the one we left.
@@ -1374,9 +1416,13 @@ class AutoSwitchEngine:
                 kw["settings"],
                 kw["current"],
             )
-            ranked = self._rank_candidates(no_return=no_return, **kw)
+            ranked = self._rank_candidates(
+                no_return=no_return, primed_recently=primed_recently, **kw
+            )
             if no_return is not None and not ranked[0] and recovered:
-                unbarred = self._rank_candidates(no_return=None, **kw)
+                unbarred = self._rank_candidates(
+                    no_return=None, primed_recently=primed_recently, **kw
+                )
                 if unbarred[0]:
                     return unbarred
             return ranked
@@ -1585,10 +1631,21 @@ class AutoSwitchEngine:
                     )
                     return TickOutcome.NO_ACTION
             note = self._switch_note(num, usage, settings, decided_now, gap_units)
+            # A move the ranking would not otherwise have made, to an account
+            # whose window has not opened: a prime. Recorded so the next tick
+            # holds here until it opens, and so an idle machine cannot be
+            # primed over and over.
+            primed = bool(
+                settings.prime_idle_clocks
+                and trigger == "runway"
+                and not _clock_started(usage.get(num))
+            )
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot, note)
+                return self._perform(
+                    num, email, trigger, left_snapshot, note, primed
+                )
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1619,7 +1676,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot, note)
+            return self._perform(num, email, trigger, left_snapshot, note, primed)
 
         if systemic or transient_failure:
             self._emit(
@@ -2022,6 +2079,7 @@ class AutoSwitchEngine:
         by_runway: bool = False,
         oauth_candidates: list[str],
         no_return: str | None,
+        primed_recently: frozenset[str] = frozenset(),
         usage: dict[str, dict | str | None],
         headroom: dict[str, float | None],
         current: str,
@@ -2189,6 +2247,13 @@ class AutoSwitchEngine:
         # Ranked last, after the thin-reserve fallback, so it is reached only
         # when nothing else is.
         barred: list[tuple[tuple, str]] = []
+        # Landable accounts whose 5-hour clock has not started. Taken only when
+        # no other move is due, and only under `autoswitch.primeIdleClocks`:
+        # this is a switch the ranking would not otherwise make, spending a few
+        # minutes of that account's weekly quota to start a window that would
+        # otherwise schedule no refresh at all. Self-limiting, because the
+        # account stops being idle the moment it is used.
+        prime: list[tuple[tuple, str]] = []
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
@@ -2369,6 +2434,16 @@ class AutoSwitchEngine:
                         or active_runway is None
                         or cand_runway < active_runway * settings.runway_margin
                     ):
+                        if (
+                            settings.prime_idle_clocks
+                            and num not in primed_recently
+                            and not _clock_started(usage.get(num))
+                        ):
+                            # Not worth moving to on its own merits, but its
+                            # clock is idle and starting one is the point.
+                            prime.append(
+                                ((-(cand_runway or 0.0), num), num)
+                            )
                         continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
@@ -2445,7 +2520,7 @@ class AutoSwitchEngine:
                 key = (-h,)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
-        qualifying = qualifying or fallback or barred
+        qualifying = qualifying or fallback or prime or barred
         qualifying.sort(key=lambda t: t[0])
         return (
             [num for _, num in qualifying],
@@ -2662,6 +2737,7 @@ class AutoSwitchEngine:
         trigger: str,
         left: tuple[float | None, float],
         note: str = "",
+        primed: bool = False,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2702,6 +2778,17 @@ class AutoSwitchEngine:
             state["schemaVersion"] = STATE_SCHEMA_VERSION
             state["lastSwitchAt"] = self.clock()
             state["lastSwitchTo"] = number
+            if primed:
+                # Stamped even though the clock may not have started: whether
+                # it did depends on a request being made, which the engine
+                # cannot cause. The stamp bounds the retry either way.
+                attempts = state.get("primedAt")
+                state["primedAt"] = {
+                    **(attempts if isinstance(attempts, dict) else {}),
+                    number: self.clock(),
+                }
+                # Held until its window opens; see the "priming" hold in tick.
+                state["primingAccount"] = number
             # WHERE we came from, so the next tick can refuse to undo this,
             # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
             # cannot fake. See `_left_account_recovered` for why the present

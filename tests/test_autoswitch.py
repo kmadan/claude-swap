@@ -7678,3 +7678,95 @@ class TestEngineAnchorsOnItsOwnThreshold:
         })
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
+
+
+class TestProactivePriming:
+    """`autoswitch.primeIdleClocks`: move to an idle clock to start it.
+
+    A 5-hour window opens on the first inference request, so an account
+    nothing has run on schedules no refresh at all. Priming is a switch the
+    ranking would not otherwise make, taken only when nothing else is due.
+    """
+
+    def _harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        h = EngineHarness(
+            temp_home, strategy="runway", prime_idle_clocks=True, **kwargs
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _fleet(self, h: EngineHarness) -> dict:
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        return {
+            # Active, far more runway than the peer: no ordinary move is due.
+            "1": _usage7(20, 3, d(7)),
+            # Idle clock, worse on runway, so only priming would take it.
+            "2": {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 63.0, "resets_at": d(5)},
+            },
+        }
+
+    def test_it_moves_to_start_an_idle_clock(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert "starts its 5h clock" in sw.note
+
+    def test_it_does_nothing_when_the_setting_is_off(self, temp_home):
+        h = EngineHarness(temp_home, strategy="runway")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_a_running_clock_is_not_a_prime_candidate(self, temp_home):
+        h = self._harness(temp_home)
+        fleet = self._fleet(h)
+        fleet["2"]["five_hour"]["resets_at"] = _iso_at(h.clock.now + 3 * 3600.0)
+        assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_it_holds_there_until_the_window_opens(self, temp_home):
+        """The switch is only worth making if the clock actually starts.
+
+        Nothing has run on the account yet, so its window is still idle;
+        moving away now would waste the switch and leave it exactly as idle.
+        """
+        h = self._harness(temp_home)
+        fleet = self._fleet(h)
+        assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
+        h.clock.advance(3600.0)
+        assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        holds = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert "priming" in holds
+
+    def test_once_the_clock_starts_it_goes_back(self, temp_home):
+        """Priming done, so the better account wins again on runway."""
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        started = self._fleet(h)
+        started["2"]["five_hour"] = {
+            "pct": 4.0,
+            "resets_at": _iso_at(h.clock.now + 5 * 3600.0),
+        }
+        h.clock.advance(3600.0)
+        assert h.tick_with_usage(started) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_an_at_limit_escape_is_not_held(self, temp_home):
+        """The hold suppresses optional moves, never a forced one."""
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        spent = self._fleet(h)
+        spent["2"] = dict(spent["2"], five_hour={"pct": 100.0})
+        h.clock.advance(3600.0)
+        assert h.tick_with_usage(spent) is TickOutcome.SWITCHED
+        assert h.active_number() == 1

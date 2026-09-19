@@ -105,6 +105,14 @@ class AutoSwitchSettings:
     # tie-break: outside the band the weekly budget decides, being the resource
     # that costs days rather than hours when it runs out. 0 disables it.
     runway_tie_band: float = 0.10
+    # Move to an account whose 5-hour window has not started, purely to start
+    # it, when no other move is due. A window opens on the first inference
+    # request and resets five hours later, so an idle clock schedules no
+    # refresh at all; starting it costs a few minutes of that account's weekly
+    # quota and buys the fleet a refresh it would not otherwise have. Each
+    # account can only be primed once per window, since it is no longer idle
+    # afterwards, so the cost is bounded and self-limiting.
+    prime_idle_clocks: bool = False
 
 
 @dataclass(frozen=True)
@@ -211,6 +219,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "runwayTieBand", "runway_tie_band", "float", 0.0, 0.5,
             help="Runway within this fraction counts as tied; prefers an unstarted 5h clock",
+        ),
+        SettingSpec(
+            "autoswitch", "primeIdleClocks", "prime_idle_clocks", "bool",
+            help="When nothing else is due, move to an idle 5h clock to start it",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
