@@ -148,14 +148,17 @@ RESET_SLACK_S = 60.0
 
 
 def binding_pct(
-    usage: dict | None, models: tuple[str, ...] = (), weight: float = 1.0
+    usage: dict | None,
+    models: tuple[str, ...] = (),
+    weight: float = 1.0,
+    threshold: float | None = None,
 ) -> float | None:
     """Utilization of the binding (worst) relevant window, or None.
 
     ``weight`` is the account's seat capacity, so cadence is planned against
     the same limits the switch decision reads rather than the unscaled ones.
     """
-    headroom = oauth.account_headroom(usage, models, weight)
+    headroom = oauth.account_headroom(usage, models, weight, threshold)
     return None if headroom is None else 100.0 - headroom
 
 

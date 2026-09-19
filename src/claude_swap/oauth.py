@@ -681,7 +681,10 @@ def effective_pct(
 
 
 def relevant_windows(
-    usage: dict | None, models: Sequence[str] = (), weight: float = 1.0
+    usage: dict | None,
+    models: Sequence[str] = (),
+    weight: float = 1.0,
+    threshold: float | None = None,
 ) -> list[tuple[str, float, str | None]]:
     """Every ``(label, pct, resets_at)`` window that gates this account.
 
@@ -706,7 +709,16 @@ def relevant_windows(
         return []
     windows: list[tuple[str, float, str | None]] = []
     selected = decision_windows()
-    limits, threshold = window_thresholds()
+    limits, file_threshold = window_thresholds()
+    # The restatement has to be anchored to the threshold the CALLER compares
+    # against, not the one in settings.json. A CLI ``--threshold`` overrides
+    # the file for the engine's comparison, and anchoring here to the file
+    # instead restates a window below its own limit to just under the FILE's
+    # threshold, which a lower effective threshold then reads as over the
+    # line. Reported by yunjeongiya on PR #355: settings 90, --threshold 85,
+    # a 7d window below its 97 limit restated to 89.99 and evicted.
+    if threshold is None:
+        threshold = file_threshold
     # The account's own limits, its seat size taken into account and floored to
     # the whole percent the usage API reports. Resolved here rather than at each
     # comparison so every consumer of this funnel reads one set of numbers.
@@ -750,7 +762,10 @@ def relevant_windows(
 
 
 def account_headroom(
-    usage: dict | None, models: Sequence[str] = (), weight: float = 1.0
+    usage: dict | None,
+    models: Sequence[str] = (),
+    weight: float = 1.0,
+    threshold: float | None = None,
 ) -> float | None:
     """Remaining percentage before this account hits a rate-limit window.
 
@@ -764,7 +779,7 @@ def account_headroom(
     or carries no window data, which callers treat as "unknown" (never
     auto-skipped).
     """
-    pcts = [pct for _, pct, _ in relevant_windows(usage, models, weight)]
+    pcts = [pct for _, pct, _ in relevant_windows(usage, models, weight, threshold)]
     if not pcts:
         return None
     return 100.0 - max(pcts)

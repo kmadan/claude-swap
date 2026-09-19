@@ -551,7 +551,10 @@ _refresh_fingerprint = oauth.credential_fingerprint
 
 
 def _window_pcts(
-    usage: dict | None, models: tuple[str, ...] = (), weight: float = 1.0
+    usage: dict | None,
+    models: tuple[str, ...] = (),
+    weight: float = 1.0,
+    threshold: float | None = None,
 ) -> dict[str, float]:
     """Ordered window label → pct: "5h", "7d", then configured scoped names.
 
@@ -561,7 +564,8 @@ def _window_pcts(
     correctly ignored it. Full per-model usage lives in ``cswap list``.
     """
     return {
-        name: pct for name, pct, _ in oauth.relevant_windows(usage, models, weight)
+        name: pct
+        for name, pct, _ in oauth.relevant_windows(usage, models, weight, threshold)
     }
 
 
@@ -599,6 +603,7 @@ def _binding_recovery_ts(
     models: Sequence[str],
     now: float,
     weight: float = 1.0,
+    threshold: float | None = None,
 ) -> float:
     """When this account's *binding* window comes back, as a sort key.
 
@@ -623,7 +628,7 @@ def _binding_recovery_ts(
     # at 40% resetting in an hour returned "back in an hour", which is the
     # opposite of what binds. An account whose binding window has no usable
     # reset is one we cannot schedule around, and inf sorts it last.
-    windows = list(oauth.relevant_windows(usage, models, weight))
+    windows = list(oauth.relevant_windows(usage, models, weight, threshold))
     if not windows:
         return float("inf")
     _label, _pct, resets_at = max(windows, key=lambda w: w[1])
@@ -632,7 +637,10 @@ def _binding_recovery_ts(
 
 
 def _weekly_runway(
-    usage: dict | str | None, now: float, weight: float = 1.0
+    usage: dict | str | None,
+    now: float,
+    weight: float = 1.0,
+    threshold: float | None = None,
 ) -> float | None:
     """Weekly headroom per day until that headroom resets, or None if unknown.
 
@@ -669,7 +677,11 @@ def _weekly_runway(
     days = (ts - now) / 86400.0
     if days <= 0:
         return None
-    limits, threshold = oauth.window_thresholds()
+    limits, file_threshold = oauth.window_thresholds()
+    # The limit an account is actually judged against, which for an unnamed
+    # window is the threshold IN FORCE rather than the one in settings.json.
+    if threshold is None:
+        threshold = file_threshold
     configured = limits.get("7d")
     limit = (
         oauth.scaled_limit(configured, weight) if configured is not None else threshold
@@ -699,6 +711,7 @@ def _reserve_units(
     models: Sequence[str],
     weight: float,
     window_ratio: float,
+    threshold: float | None = None,
 ) -> float:
     """Reserve on the binding window, in units of one 5-hour point.
 
@@ -715,7 +728,7 @@ def _reserve_units(
     points left on the 5h" less than a quarter of the work in "3 points left
     on the week", where the raw numbers say the opposite.
     """
-    windows = list(oauth.relevant_windows(usage, models, weight))
+    windows = list(oauth.relevant_windows(usage, models, weight, threshold))
     if not windows:
         return 0.0
     label, pct, _resets_at = max(windows, key=lambda w: w[1])
@@ -754,6 +767,7 @@ def _headroom_by_account(
     usage: dict[str, dict | str | None],
     models: tuple[str, ...],
     weights: dict[str, float] | None = None,
+    threshold: float | None = None,
 ) -> dict[str, float | None]:
     """Per-account headroom derived from decision values.
 
@@ -767,6 +781,7 @@ def _headroom_by_account(
             value if isinstance(value, dict) else None,
             models,
             weights.get(num, 1.0),
+            threshold,
         )
         for num, value in usage.items()
     }
@@ -1132,7 +1147,10 @@ class AutoSwitchEngine:
                     num: pcts
                     for num, value in usage.items()
                     if (pcts := _window_pcts(
-                        value if isinstance(value, dict) else None, self._models
+                        value if isinstance(value, dict) else None,
+                        self._models,
+                        self._weights.get(num, 1.0),
+                        settings.threshold,
                     ))
                 },
             )
@@ -1393,7 +1411,9 @@ class AutoSwitchEngine:
                 fetch={current, *candidates}
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
-            headroom = _headroom_by_account(usage, self._models, self._weights)
+            headroom = _headroom_by_account(
+                usage, self._models, self._weights, settings.threshold
+            )
             active_headroom = headroom.get(current)
             decided_now = self.clock()
             ordered, any_known, active_reset_ts, held_on_active, gap_units = _rank(
@@ -1450,6 +1470,7 @@ class AutoSwitchEngine:
                         usage.get(current),
                         decided_now,
                         self._weights.get(current, 1.0),
+                        settings.threshold,
                     )
                     is None
                     else (
@@ -1537,6 +1558,7 @@ class AutoSwitchEngine:
                 self._models,
                 decided_now,
                 self._weights.get(current, 1.0),
+                settings.threshold,
             ),
         )
         transient_failure = False
@@ -1903,10 +1925,12 @@ class AutoSwitchEngine:
             if h is not None and h > 100.0 - settings.threshold:
                 return True
             peer_recovery_ts = _binding_recovery_ts(
-                usage.get(barred), self._models, now, self._weights.get(barred, 1.0)
+                usage.get(barred), self._models, now,
+                self._weights.get(barred, 1.0), settings.threshold,
             )
             active_recovery_ts = _binding_recovery_ts(
-                usage.get(current), self._models, now, self._weights.get(current, 1.0)
+                usage.get(current), self._models, now,
+                self._weights.get(current, 1.0), settings.threshold,
             )
             # The active's recovery must be a REAL measurement, not merely
             # "larger" -- `_binding_recovery_ts` returns `inf` for both
@@ -1984,7 +2008,8 @@ class AutoSwitchEngine:
         was = left_recovery if isinstance(left_recovery, (int, float)) else float("inf")
         return (
             _binding_recovery_ts(
-                usage.get(barred), self._models, now, self._weights.get(barred, 1.0)
+                usage.get(barred), self._models, now,
+                self._weights.get(barred, 1.0), settings.threshold,
             )
             < was - RECOVERY_HYSTERESIS_S
         )
@@ -2020,7 +2045,10 @@ class AutoSwitchEngine:
         # move is measured against this, so an unknown value blocks the move
         # rather than licensing one on no evidence.
         active_runway = (
-            _weekly_runway(usage.get(current), now, self._weights.get(current, 1.0))
+            _weekly_runway(
+                usage.get(current), now, self._weights.get(current, 1.0),
+                settings.threshold,
+            )
             if by_runway
             else None
         )
@@ -2080,7 +2108,8 @@ class AutoSwitchEngine:
         if all_above and by_runway:
             returns = [
                 _binding_recovery_ts(
-                    usage.get(num), self._models, now, self._weights.get(num, 1.0)
+                    usage.get(num), self._models, now,
+                    self._weights.get(num, 1.0), settings.threshold,
                 )
                 for num in (current, *oauth_candidates)
             ]
@@ -2093,6 +2122,7 @@ class AutoSwitchEngine:
                 self._models,
                 self._weights.get(current, 1.0),
                 settings.window_ratio,
+                settings.threshold,
             )
             # The best a move could offer, on both axes that matter: work
             # available now, and when that work comes back.
@@ -2108,6 +2138,7 @@ class AutoSwitchEngine:
                         self._models,
                         self._weights.get(num, 1.0),
                         settings.window_ratio,
+                        settings.threshold,
                     ),
                 )
                 best_return = min(
@@ -2118,7 +2149,8 @@ class AutoSwitchEngine:
                 )
         active_recovery_ts = (
             _binding_recovery_ts(
-                usage.get(current), self._models, now, self._weights.get(current, 1.0)
+                usage.get(current), self._models, now,
+                self._weights.get(current, 1.0), settings.threshold,
             )
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
@@ -2136,7 +2168,8 @@ class AutoSwitchEngine:
                 if (100.0 - cand_h) >= settings.threshold:
                     continue
                 value = _weekly_runway(
-                    usage.get(cand), now, self._weights.get(cand, 1.0)
+                    usage.get(cand), now, self._weights.get(cand, 1.0),
+                    settings.threshold,
                 )
                 if value is not None:
                     best_runway = max(best_runway, value)
@@ -2177,7 +2210,10 @@ class AutoSwitchEngine:
                 else None
             )
             cand_runway = (
-                _weekly_runway(usage.get(num), now, self._weights.get(num, 1.0))
+                _weekly_runway(
+                    usage.get(num), now, self._weights.get(num, 1.0),
+                    settings.threshold,
+                )
                 if by_runway
                 else None
             )
@@ -2221,6 +2257,7 @@ class AutoSwitchEngine:
                             self._models,
                             self._weights.get(num, 1.0),
                             settings.window_ratio,
+                            settings.threshold,
                         )
                         if by_runway
                         else 0.0
@@ -2490,6 +2527,7 @@ class AutoSwitchEngine:
                     active_pre.last_good,
                     self._models,
                     self._weights.get(current, 1.0),
+                    self.settings.threshold,
                 )
                 or 0.0
             )
@@ -2532,6 +2570,7 @@ class AutoSwitchEngine:
             active_value if isinstance(active_value, dict) else None,
             self._models,
             self._weights.get(current, 1.0),
+            threshold if threshold is not None else self.settings.threshold,
         )
         # The caller's tick-snapshotted threshold, so one tick fetches and
         # decides on the same value even if apply_threshold() lands mid-tick.
@@ -2557,6 +2596,7 @@ class AutoSwitchEngine:
                     value if isinstance(value, dict) else None,
                     self._models,
                     self._weights.get(num, 1.0),
+                    threshold if threshold is not None else self.settings.threshold,
                 )
                 if (
                     entry is not None
@@ -2573,7 +2613,12 @@ class AutoSwitchEngine:
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
 
-        headroom = _headroom_by_account(usage, self._models, self._weights)
+        headroom = _headroom_by_account(
+            usage,
+            self._models,
+            self._weights,
+            threshold if threshold is not None else self.settings.threshold,
+        )
         return entries, usage, headroom
 
     def _switch_note(
@@ -2594,12 +2639,13 @@ class AutoSwitchEngine:
             return ""
         weight = self._weights.get(num, 1.0)
         parts = []
-        runway = _weekly_runway(usage.get(num), now, weight)
+        runway = _weekly_runway(usage.get(num), now, weight, settings.threshold)
         if runway is not None:
             parts.append(f"{runway:.1f} weekly pts/day")
         if gap_units > 0.0:
             units = _reserve_units(
-                usage.get(num), self._models, weight, settings.window_ratio
+                usage.get(num), self._models, weight, settings.window_ratio,
+                settings.threshold,
             )
             if units >= gap_units:
                 parts.append(f"reserve {units:.0f}u covers the {gap_units:.0f}u gap")
