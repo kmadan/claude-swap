@@ -2520,6 +2520,15 @@ class AutoSwitchEngine:
                 key = (-h,)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
+        if prime and trigger == "runway":
+            # Finish priming before optimising. Each idle clock is one switch
+            # to start and one to leave; interleaving an ordinary move between
+            # every pair doubles that for no gain, since the account with the
+            # most runway is still there afterwards and the windows opened in
+            # the meantime. Only reachable when priming is enabled, and only
+            # for the below-threshold move: a forced one is never deferred to
+            # start a clock.
+            qualifying = prime
         qualifying = qualifying or fallback or prime or barred
         qualifying.sort(key=lambda t: t[0])
         return (

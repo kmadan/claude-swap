@@ -7770,3 +7770,74 @@ class TestProactivePriming:
         h.clock.advance(3600.0)
         assert h.tick_with_usage(spent) is TickOutcome.SWITCHED
         assert h.active_number() == 1
+
+
+class TestPrimingRunsAsAPass:
+    """Idle clocks are started back to back, before optimising again.
+
+    Each prime costs one switch to start the clock and one to leave. Returning
+    to the best account between every pair doubles that, and buys nothing: the
+    best account is still there when the pass ends.
+    """
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="runway", prime_idle_clocks=True)
+        for num, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(num, email)
+        h.make_live("a@example.com", 1)
+        return h
+
+    @staticmethod
+    def _idle(pct7: float, days: float, h: EngineHarness) -> dict:
+        return {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {
+                "pct": pct7,
+                "resets_at": _iso_at(h.clock.now + days * 86400.0),
+            },
+        }
+
+    def test_a_prime_outranks_an_ordinary_move(self, temp_home):
+        """#3 is the better account on runway; #2's clock is idle."""
+        h = self._harness(temp_home)
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(30, 70, d(4)),            # active, modest runway
+            "2": self._idle(63.0, 5.0, h),         # idle clock, worse runway
+            "3": _usage7(5, 3, d(7)),              # best runway, clock running
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert "starts its 5h clock" in sw.note
+
+    def test_the_ordinary_move_lands_once_no_clock_is_idle(self, temp_home):
+        h = self._harness(temp_home)
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(30, 70, d(4)),
+            # Clock now running: _usage7 sets no 5h reset, so it has to be
+            # given one explicitly or the account still reads as idle.
+            "2": {
+                "five_hour": {
+                    "pct": 10.0,
+                    "resets_at": _iso_at(h.clock.now + 3 * 3600.0),
+                },
+                "seven_day": {"pct": 63.0, "resets_at": d(5)},
+            },
+            "3": _usage7(5, 3, d(7)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_a_forced_move_is_never_deferred_to_prime(self, temp_home):
+        """At its limit the engine must leave, not start someone's clock."""
+        h = self._harness(temp_home)
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 70, d(4)),           # active is spent
+            "2": self._idle(63.0, 5.0, h),
+            "3": _usage7(5, 3, d(7)),              # most headroom
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
