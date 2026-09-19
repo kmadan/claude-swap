@@ -1283,7 +1283,23 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first", "runway") and self._in_cooldown(state):
+        # A priming pass is not flapping, and the cooldown is there to bound
+        # flapping. A prime's purpose is served the moment the window opens, so
+        # holding the engine on that account for another cooldown costs working
+        # time on a worse account and buys nothing. The exemption ends itself:
+        # the move that leaves a primed account is not a prime, so it clears the
+        # flag and the next optional move waits again. It is bounded anyway,
+        # since an account can only be primed once per window.
+        prime_exempt = bool(
+            settings.prime_idle_clocks
+            and trigger == "runway"
+            and state.get("lastSwitchPrimed")
+        )
+        if (
+            trigger in ("proactive", "consume-first", "runway")
+            and not prime_exempt
+            and self._in_cooldown(state)
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -2770,7 +2786,18 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first", "runway") and self._in_cooldown(state):
+            # Same exemption as the tick's check, on the same state: deciding
+            # to move and then refusing it here would strand the engine on the
+            # primed account for a cooldown after its window opened.
+            if (
+                trigger in ("proactive", "consume-first", "runway")
+                and not (
+                    self.settings.prime_idle_clocks
+                    and trigger == "runway"
+                    and state.get("lastSwitchPrimed")
+                )
+                and self._in_cooldown(state)
+            ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 

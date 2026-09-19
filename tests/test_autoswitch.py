@@ -7841,3 +7841,64 @@ class TestPrimingRunsAsAPass:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
+
+
+class TestPrimingIsNotHeldByTheCooldown:
+    """Leaving a primed account must not wait out the flap leash.
+
+    Measured: the engine primed account 4 at 21:31:34 and returned to the
+    better account at 21:36:37, five minutes and three seconds later, which is
+    exactly `cooldownSeconds`. The window opened within seconds of the prime,
+    so those five minutes were spent working on a worse account for nothing.
+    """
+
+    def _harness(self, temp_home: Path, last_was_prime: bool) -> EngineHarness:
+        h = EngineHarness(
+            temp_home,
+            strategy="runway",
+            prime_idle_clocks=True,
+            cooldown_seconds=300.0,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        # Arrived here moments ago; the cooldown has barely begun.
+        h.engine._mutate_state(
+            lambda s: s.update(
+                {
+                    "lastSwitchAt": h.clock.now,
+                    "lastSwitchTo": "1",
+                    "lastSwitchPrimed": last_was_prime,
+                }
+            )
+        )
+        h.clock.advance(20.0)
+        return h
+
+    def _fleet(self, h: EngineHarness) -> dict:
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        started = lambda pct: {
+            "pct": pct,
+            "resets_at": _iso_at(h.clock.now + 5 * 3600.0),
+        }
+        return {
+            # The account just primed: its window opened, and it is the worse
+            # of the two on runway.
+            "1": {"five_hour": started(2.0), "seven_day": {"pct": 68.0, "resets_at": d(5)}},
+            # Better runway, clock already running, so taking it is an ordinary
+            # move rather than another prime.
+            "2": {"five_hour": started(25.0), "seven_day": {"pct": 25.0, "resets_at": d(7)}},
+        }
+
+    def test_the_return_does_not_wait_for_the_cooldown(self, temp_home):
+        h = self._harness(temp_home, last_was_prime=True)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_an_ordinary_move_still_waits(self, temp_home):
+        """The exemption is for a prime's return, not for switching at large."""
+        h = self._harness(temp_home, last_was_prime=False)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.NO_ACTION
+        assert "cooldown" in [
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ]
