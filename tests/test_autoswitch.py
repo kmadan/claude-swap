@@ -14,6 +14,7 @@ import pytest
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
+    PRIME_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
     RECOVERY_HORIZON_S,
     SPENT_HEADROOM_PCT,
@@ -7731,16 +7732,18 @@ class TestProactivePriming:
         assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
 
-    def test_it_holds_there_until_the_window_opens(self, temp_home):
+    def test_it_holds_there_while_the_window_may_still_open(self, temp_home):
         """The switch is only worth making if the clock actually starts.
 
-        Nothing has run on the account yet, so its window is still idle;
-        moving away now would waste the switch and leave it exactly as idle.
+        Nothing has run on the account yet, so its window is still idle and
+        moving away now would waste the switch. The hold is bounded by
+        PRIME_HOLD_MAX_S; see TestPrimingHoldIsCapped for what happens when it
+        runs out.
         """
         h = self._harness(temp_home)
         fleet = self._fleet(h)
         assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
-        h.clock.advance(3600.0)
+        h.clock.advance(20.0)
         assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
         assert h.active_number() == 2
         holds = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
@@ -7902,3 +7905,70 @@ class TestPrimingIsNotHeldByTheCooldown:
         assert "cooldown" in [
             e.reason for e in h.events if isinstance(e, NoSwitchEvent)
         ]
+
+
+class TestPrimingHoldIsCapped:
+    """A hold must not spend the window it just opened.
+
+    Measured: priming account 5 held for 5.2 minutes waiting to observe the
+    window open, and under a burst at 5.4 points a minute that cost 28% of
+    that window. The hold exists so the switch is not wasted, which takes
+    seconds, not minutes.
+    """
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="runway", prime_idle_clocks=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _fleet(self, h: EngineHarness) -> dict:
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        return {
+            # Active, clock still idle: this is the account being primed.
+            "1": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 68.0, "resets_at": d(5)}},
+            "2": {
+                "five_hour": {
+                    "pct": 25.0,
+                    "resets_at": _iso_at(h.clock.now + 4 * 3600.0),
+                },
+                "seven_day": {"pct": 25.0, "resets_at": d(7)},
+            },
+        }
+
+    def _arrive_by_priming(self, h: EngineHarness, held_for: float) -> None:
+        h.engine._mutate_state(
+            lambda s: s.update(
+                {
+                    "lastSwitchAt": h.clock.now - held_for,
+                    "lastSwitchTo": "1",
+                    "lastSwitchPrimed": True,
+                    "primingAccount": "1",
+                    "primingSince": h.clock.now - held_for,
+                }
+            )
+        )
+
+    def test_it_holds_briefly_while_the_window_may_still_open(self, temp_home):
+        h = self._harness(temp_home)
+        self._arrive_by_priming(h, held_for=20.0)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert "priming" in [
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ]
+
+    def test_it_gives_up_rather_than_spend_the_window(self, temp_home):
+        h = self._harness(temp_home)
+        self._arrive_by_priming(h, held_for=PRIME_HOLD_MAX_S + 5.0)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_giving_up_clears_the_hold(self, temp_home):
+        h = self._harness(temp_home)
+        self._arrive_by_priming(h, held_for=PRIME_HOLD_MAX_S + 5.0)
+        h.tick_with_usage(self._fleet(h))
+        state = h.engine._read_state()
+        assert "primingAccount" not in state
+        assert "primingSince" not in state

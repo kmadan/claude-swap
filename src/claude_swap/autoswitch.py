@@ -170,6 +170,18 @@ RUNWAY_MARGIN_RATIO = 2.0
 # still starting the clock promptly once work resumes.
 PRIME_RETRY_S = 3600.0
 
+# Longest a prime may hold the engine on the account it went to start. The hold
+# waits to OBSERVE the window open, and observation costs a poll: the active
+# account is polled every few minutes, so an uncapped hold runs for that long
+# on an account chosen for its clock rather than its quota. Measured on a live
+# fleet during a subagent burst at 5.4 points a minute, a five-minute hold
+# spent 28% of the window it had just opened. Three ticks is enough for a
+# window to open under any traffic that would make priming worth doing, and
+# caps the cost at a point or two. Leaving early risks nothing: if the window
+# did open, the account is primed either way, and if it did not, PRIME_RETRY_S
+# governs when to try again.
+PRIME_HOLD_MAX_S = 45.0
+
 # Least reserve worth a switch during the at-limit escape, in units of one
 # 5-hour point (see ``_reserve_units``). Every switch costs a credential pickup
 # and interrupts whatever is running, so landing on an account that can serve
@@ -1215,10 +1227,21 @@ class AutoSwitchEngine:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
 
             if trigger == "runway" and state.get("primingAccount") == current:
-                if _clock_started(usage.get(current)):
-                    # The window opened, so the prime is finished and normal
-                    # ranking resumes on this same tick.
-                    self._mutate_state(lambda s: s.pop("primingAccount", None))
+                since = state.get("primingSince")
+                expired = (
+                    isinstance(since, (int, float))
+                    and self.clock() - since > PRIME_HOLD_MAX_S
+                )
+                if _clock_started(usage.get(current)) or expired:
+                    # The window opened, or the hold has run long enough that
+                    # waiting costs more than the prime is worth. Either way the
+                    # prime is over and normal ranking resumes on this tick.
+                    self._mutate_state(
+                        lambda s: (
+                            s.pop("primingAccount", None),
+                            s.pop("primingSince", None),
+                        )
+                    )
                 else:
                     # Switched here to start a clock, and no request has
                     # started it yet. Moving away now would waste the switch
@@ -2825,6 +2848,7 @@ class AutoSwitchEngine:
                 }
                 # Held until its window opens; see the "priming" hold in tick.
                 state["primingAccount"] = number
+                state["primingSince"] = self.clock()
             # WHERE we came from, so the next tick can refuse to undo this,
             # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
             # cannot fake. See `_left_account_recovered` for why the present
