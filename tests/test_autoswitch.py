@@ -14,7 +14,8 @@ import pytest
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
-    PRIME_HOLD_MAX_S,
+    PRIME_RETRY_MIN_S,
+    PRIME_RETRY_S,
     NO_RESET_FALLBACK_S,
     RECOVERY_HORIZON_S,
     SPENT_HEADROOM_PCT,
@@ -7732,22 +7733,20 @@ class TestProactivePriming:
         assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
 
-    def test_it_holds_there_while_the_window_may_still_open(self, temp_home):
-        """The switch is only worth making if the clock actually starts.
+    def test_it_leaves_on_the_next_tick(self, temp_home):
+        """A prime is one tick on that account, not a stay.
 
-        Nothing has run on the account yet, so its window is still idle and
-        moving away now would waste the switch. The hold is bounded by
-        PRIME_HOLD_MAX_S; see TestPrimingHoldIsCapped for what happens when it
-        runs out.
+        Confirming the window opened would cost a poll, and the store floors a
+        fresh reading at SERVE_TTL_S, so any wait long enough to observe one is
+        long enough to spend the window it just opened: measured at 28% of a
+        window under a burst.
         """
         h = self._harness(temp_home)
-        fleet = self._fleet(h)
-        assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
-        h.clock.advance(20.0)
-        assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        holds = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert "priming" in holds
+        h.clock.advance(15.0)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
 
     def test_once_the_clock_starts_it_goes_back(self, temp_home):
         """Priming done, so the better account wins again on runway."""
@@ -7907,13 +7906,16 @@ class TestPrimingIsNotHeldByTheCooldown:
         ]
 
 
-class TestPrimingHoldIsCapped:
-    """A hold must not spend the window it just opened.
 
-    Measured: priming account 5 held for 5.2 minutes waiting to observe the
-    window open, and under a burst at 5.4 points a minute that cost 28% of
-    that window. The hold exists so the switch is not wasted, which takes
-    seconds, not minutes.
+
+class TestPrimeRetryNeedsEvidence:
+    """A prime that lands nothing is retried, but only if work is happening.
+
+    Without a hold a prime is a single tick, so an attempt can miss: the
+    client may not have picked up the credential yet. Retrying is cheap and
+    worth doing. Retrying while the machine is idle is not, since with no
+    traffic no clock can start and the engine would switch back and forth for
+    as long as nothing is happening.
     """
 
     def _harness(self, temp_home: Path) -> EngineHarness:
@@ -7923,52 +7925,45 @@ class TestPrimingHoldIsCapped:
         h.make_live("a@example.com", 1)
         return h
 
-    def _fleet(self, h: EngineHarness) -> dict:
+    def _fleet(self, h: EngineHarness, active_5h: float = 20.0) -> dict:
         d = lambda n: _iso_at(h.clock.now + n * 86400.0)
         return {
-            # Active, clock still idle: this is the account being primed.
-            "1": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 68.0, "resets_at": d(5)}},
-            "2": {
-                "five_hour": {
-                    "pct": 25.0,
-                    "resets_at": _iso_at(h.clock.now + 4 * 3600.0),
-                },
-                "seven_day": {"pct": 25.0, "resets_at": d(7)},
-            },
+            "1": _usage7(active_5h, 3, d(7)),
+            # Never opens: the prime keeps missing.
+            "2": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 63.0, "resets_at": d(5)}},
         }
 
-    def _arrive_by_priming(self, h: EngineHarness, held_for: float) -> None:
-        h.engine._mutate_state(
-            lambda s: s.update(
-                {
-                    "lastSwitchAt": h.clock.now - held_for,
-                    "lastSwitchTo": "1",
-                    "lastSwitchPrimed": True,
-                    "primingAccount": "1",
-                    "primingSince": h.clock.now - held_for,
-                }
-            )
-        )
-
-    def test_it_holds_briefly_while_the_window_may_still_open(self, temp_home):
-        h = self._harness(temp_home)
-        self._arrive_by_priming(h, held_for=20.0)
-        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.NO_ACTION
+    def _prime_then_return(self, h: EngineHarness, active_5h: float = 20.0) -> None:
+        assert h.tick_with_usage(self._fleet(h, active_5h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(15.0)
+        assert h.tick_with_usage(self._fleet(h, active_5h)) is TickOutcome.SWITCHED
         assert h.active_number() == 1
-        assert "priming" in [
-            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
-        ]
 
-    def test_it_gives_up_rather_than_spend_the_window(self, temp_home):
+    def test_it_does_not_retry_straight_away(self, temp_home):
         h = self._harness(temp_home)
-        self._arrive_by_priming(h, held_for=PRIME_HOLD_MAX_S + 5.0)
-        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        self._prime_then_return(h)
+        h.clock.advance(30.0)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.NO_ACTION
+
+    def test_it_does_not_retry_on_an_idle_machine(self, temp_home):
+        """Past the short gap, but nothing has been used since."""
+        h = self._harness(temp_home)
+        self._prime_then_return(h)
+        h.clock.advance(PRIME_RETRY_MIN_S + 60.0)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.NO_ACTION
+
+    def test_it_retries_once_work_has_happened(self, temp_home):
+        """Same gap, but the fleet's usage moved, so a clock could have started."""
+        h = self._harness(temp_home)
+        self._prime_then_return(h)
+        h.clock.advance(PRIME_RETRY_MIN_S + 60.0)
+        assert h.tick_with_usage(self._fleet(h, active_5h=45.0)) is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
-    def test_giving_up_clears_the_hold(self, temp_home):
+    def test_the_long_bound_retries_regardless(self, temp_home):
         h = self._harness(temp_home)
-        self._arrive_by_priming(h, held_for=PRIME_HOLD_MAX_S + 5.0)
-        h.tick_with_usage(self._fleet(h))
-        state = h.engine._read_state()
-        assert "primingAccount" not in state
-        assert "primingSince" not in state
+        self._prime_then_return(h)
+        h.clock.advance(PRIME_RETRY_S + 60.0)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
