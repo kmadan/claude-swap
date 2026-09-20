@@ -179,23 +179,6 @@ PRIME_RETRY_S = 3600.0
 # that evidence the long bound above still governs.
 PRIME_RETRY_MIN_S = 120.0
 
-
-def _fleet_five_hour_pct(usage: dict[str, dict | str | None]) -> float:
-    """Total 5-hour utilization across the fleet, as an activity signal.
-
-    Crude on purpose: the engine cannot see requests, only their effect, and
-    any request at all raises one of these windows. Used to tell "the prime did
-    not land yet" from "nothing is happening here".
-    """
-    total = 0.0
-    for value in usage.values():
-        if not isinstance(value, dict):
-            continue
-        window = value.get("five_hour")
-        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
-            total += float(window["pct"])
-    return total
-
 # Least reserve worth a switch during the at-limit escape, in units of one
 # 5-hour point (see ``_reserve_units``). Every switch costs a credential pickup
 # and interrupts whatever is running, so landing on an account that can serve
@@ -211,6 +194,7 @@ ESCAPE_MIN_RESERVE_UNITS = 4.0
 # sit where quota returns first, however far out — rather than parking on
 # whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
+
 
 
 def _recovery_is_useful(
@@ -1240,6 +1224,40 @@ class AutoSwitchEngine:
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
 
+            if trigger == "runway" and state.get("primingAccount") == current:
+                since = state.get("primingSince")
+                waited = (
+                    self.clock() - since if isinstance(since, (int, float)) else 0.0
+                )
+                if (
+                    _clock_started(usage.get(current))
+                    or waited >= settings.prime_hold_seconds
+                ):
+                    # The window opened, or the client has had long enough to
+                    # pick the credential up. Either way the prime is over and
+                    # ranking resumes on this tick.
+                    self._mutate_state(
+                        lambda s: (
+                            s.pop("primingAccount", None),
+                            s.pop("primingSince", None),
+                        )
+                    )
+                else:
+                    # Moving away now would waste the switch: the engine hands
+                    # the credential over, and the window opens only when the
+                    # client next calls.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="priming",
+                            detail=(
+                                f"holding {waited:.0f}s of "
+                                f"{settings.prime_hold_seconds:.0f}s for the "
+                                "client to pick up the credential"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1443,25 +1461,68 @@ class AutoSwitchEngine:
         # to the same idle account every cooldown for as long as the machine
         # sits idle.
         stamps = state.get("primedAt")
-        marks = state.get("primeMark")
-        marks = marks if isinstance(marks, dict) else {}
-        fleet_pct = _fleet_five_hour_pct(usage)
+        stamps = stamps if isinstance(stamps, dict) else {}
+        tries = state.get("primeTries")
+        tries = tries if isinstance(tries, dict) else {}
+
+        # An account seen with its window open has nothing left to prove, so
+        # its history is cleared and the next idle window starts fresh.
+        opened = {num for num in stamps if _clock_started(usage.get(num))}
+        if opened:
+            self._mutate_state(
+                lambda s: s.update(
+                    {
+                        "primedAt": {
+                            k: v
+                            for k, v in (s.get("primedAt") or {}).items()
+                            if k not in opened
+                        },
+                        "primeTries": {
+                            k: v
+                            for k, v in (s.get("primeTries") or {}).items()
+                            if k not in opened
+                        },
+                    }
+                )
+            )
+            stamps = {k: v for k, v in stamps.items() if k not in opened}
 
         def _retry_barred(num: str, ts: float) -> bool:
-            """Whether another attempt on this account would be noise."""
-            age = decided_now - ts
-            if age >= PRIME_RETRY_S:
-                return False  # long bound reached: try again regardless
-            if age < PRIME_RETRY_MIN_S:
-                return True  # too soon to tell whether it landed
-            mark = marks.get(num)
-            # Worth another attempt only if the fleet has done some work since,
-            # since with no traffic no clock could have started anyway.
-            return not (isinstance(mark, (int, float)) and fleet_pct > mark)
+            """Whether another attempt on this account would be noise.
+
+            Two questions, both about THIS account. An earlier version asked
+            whether any work had happened anywhere, which is true whenever the
+            user is working at all, so a prime that had in fact landed was
+            repeated every two minutes and the engine cycled through the idle
+            accounts.
+
+            First, has a reading arrived SINCE the attempt? Until one does,
+            whether the window opened is unknown, and acting on an older
+            reading is what produced that loop.
+
+            Second, how many attempts have already missed? Each doubles the
+            wait, from PRIME_RETRY_MIN_S up to PRIME_RETRY_S, so an account
+            that cannot be primed, because nothing is calling, costs a couple
+            of switches rather than a stream of them.
+            """
+            attempts = tries.get(num)
+            attempts = attempts if isinstance(attempts, int) and attempts > 0 else 1
+            gap = min(PRIME_RETRY_MIN_S * (2 ** (attempts - 1)), PRIME_RETRY_S)
+            # Counted from when the attempt ENDED, not when it began: the
+            # dwell is part of the attempt, and charging it against the gap
+            # would leave only seconds between leaving an account and trying
+            # it again.
+            since_attempt = decided_now - ts - settings.prime_hold_seconds
+            if since_attempt < gap:
+                return True
+            entry = entries.get(num)
+            fetched = getattr(entry, "fetched_at", None)
+            # No reading since the attempt: cannot tell, so do not act.
+            return not (isinstance(fetched, (int, float)) and fetched > ts)
 
         primed_recently = frozenset(
             num
-            for num, ts in (stamps if isinstance(stamps, dict) else {}).items()
+            for num, ts in stamps.items()
             if isinstance(ts, (int, float)) and _retry_barred(num, ts)
         )
 
@@ -1681,7 +1742,7 @@ class AutoSwitchEngine:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
                 return self._perform(
-                    num, email, trigger, left_snapshot, note, primed, fleet_pct
+                    num, email, trigger, left_snapshot, note, primed
                 )
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
@@ -1713,9 +1774,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(
-                num, email, trigger, left_snapshot, note, primed, fleet_pct
-            )
+            return self._perform(num, email, trigger, left_snapshot, note, primed)
 
         if systemic or transient_failure:
             self._emit(
@@ -2786,7 +2845,6 @@ class AutoSwitchEngine:
         left: tuple[float | None, float],
         note: str = "",
         primed: bool = False,
-        prime_mark: float = 0.0,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2847,21 +2905,20 @@ class AutoSwitchEngine:
                     **(attempts if isinstance(attempts, dict) else {}),
                     number: self.clock(),
                 }
-                # Fleet-wide 5h usage at the moment of the attempt, so the next
-                # decision can tell whether any work has happened since.
-                previous = state.get("primeMark")
-                state["primeMark"] = {
-                    **(previous if isinstance(previous, dict) else {}),
-                    number: prime_mark,
+                # Attempts since this account's window was last seen open,
+                # which is what the retry backoff reads.
+                counts = state.get("primeTries")
+                counts = counts if isinstance(counts, dict) else {}
+                seen = counts.get(number)
+                state["primeTries"] = {
+                    **counts,
+                    number: (seen if isinstance(seen, int) else 0) + 1,
                 }
-                # No hold: the engine leaves on the next tick. Confirming the
-                # window opened would cost a poll, and the store floors a fresh
-                # reading at SERVE_TTL_S, so any hold long enough to observe one
-                # is long enough to spend the window it just opened. Measured at
-                # 28% of a window under a burst. If the prime did not land,
-                # because the client had not picked up the credential yet, the
-                # account is still idle at the next reading and PRIME_RETRY_S
-                # governs the retry.
+                # Held for autoswitch.primeHoldSeconds, long enough for the
+                # client to pick the credential up and call; see the "priming"
+                # hold in tick.
+                state["primingAccount"] = number
+                state["primingSince"] = self.clock()
             # Whether THIS move was a prime, so the next optional move can skip
             # the cooldown and return without waiting out the flap leash.
             state["lastSwitchPrimed"] = bool(primed)

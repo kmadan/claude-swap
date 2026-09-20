@@ -113,6 +113,13 @@ class AutoSwitchSettings:
     # account can only be primed once per window, since it is no longer idle
     # afterwards, so the cost is bounded and self-limiting.
     prime_idle_clocks: bool = False
+    # How long to stay on an account moved to purely to start its 5-hour
+    # window. The engine cannot cause a request: it hands the credential over
+    # and the window opens when the client next calls, which takes longer than
+    # a tick. Measured, a 16-second visit started nothing across two attempts
+    # while five-minute visits started four out of four. Too short wastes the
+    # switch; too long spends the window it just opened.
+    prime_hold_seconds: float = 90.0
 
 
 @dataclass(frozen=True)
@@ -223,6 +230,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "primeIdleClocks", "prime_idle_clocks", "bool",
             help="When nothing else is due, move to an idle 5h clock to start it",
+        ),
+        SettingSpec(
+            "autoswitch", "primeHoldSeconds", "prime_hold_seconds", "float", 0.0, 600.0,
+            help="Seconds to stay on a primed account so the client can pick it up",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

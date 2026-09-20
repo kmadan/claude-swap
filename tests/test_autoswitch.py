@@ -15,7 +15,6 @@ from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
     PRIME_RETRY_MIN_S,
-    PRIME_RETRY_S,
     NO_RESET_FALLBACK_S,
     RECOVERY_HORIZON_S,
     SPENT_HEADROOM_PCT,
@@ -7702,8 +7701,15 @@ class TestProactivePriming:
     def _fleet(self, h: EngineHarness) -> dict:
         d = lambda n: _iso_at(h.clock.now + n * 86400.0)
         return {
-            # Active, far more runway than the peer: no ordinary move is due.
-            "1": _usage7(20, 3, d(7)),
+            # Active, far more runway than the peer, and its own clock already
+            # running: returning here is an ordinary move, not another prime.
+            "1": {
+                "five_hour": {
+                    "pct": 20.0,
+                    "resets_at": _iso_at(h.clock.now + 4 * 3600.0),
+                },
+                "seven_day": {"pct": 3.0, "resets_at": d(7)},
+            },
             # Idle clock, worse on runway, so only priming would take it.
             "2": {
                 "five_hour": {"pct": 0.0},
@@ -7733,18 +7739,26 @@ class TestProactivePriming:
         assert h.tick_with_usage(fleet) is TickOutcome.NO_ACTION
         assert h.active_number() == 1
 
-    def test_it_leaves_on_the_next_tick(self, temp_home):
-        """A prime is one tick on that account, not a stay.
+    def test_it_stays_while_the_client_picks_the_credential_up(self, temp_home):
+        """The engine cannot cause a request; it can only wait for one.
 
-        Confirming the window opened would cost a poll, and the store floors a
-        fresh reading at SERVE_TTL_S, so any wait long enough to observe one is
-        long enough to spend the window it just opened: measured at 28% of a
-        window under a burst.
+        Measured on a live fleet: a 16-second visit started no window across
+        two attempts, while five-minute visits started four out of four. The
+        dwell is autoswitch.primeHoldSeconds.
         """
         h = self._harness(temp_home)
         assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
         assert h.active_number() == 2
         h.clock.advance(15.0)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.NO_ACTION
+        assert "priming" in [
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ]
+
+    def test_it_leaves_once_the_dwell_is_up(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        h.clock.advance(h.engine.settings.prime_hold_seconds + 5.0)
         assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
         assert h.active_number() == 1
 
@@ -7908,62 +7922,86 @@ class TestPrimingIsNotHeldByTheCooldown:
 
 
 
-class TestPrimeRetryNeedsEvidence:
-    """A prime that lands nothing is retried, but only if work is happening.
+class TestPrimeRetryBacksOff:
+    """A prime that lands nothing is retried, with a widening gap.
 
-    Without a hold a prime is a single tick, so an attempt can miss: the
-    client may not have picked up the credential yet. Retrying is cheap and
-    worth doing. Retrying while the machine is idle is not, since with no
-    traffic no clock can start and the engine would switch back and forth for
-    as long as nothing is happening.
+    Without a backoff the engine cycled: three idle accounts, primed in turn
+    every two minutes, 2 -> 8 -> 6 -> 2 on a live fleet. Each miss now doubles
+    the wait for that account, and an account seen with its window open starts
+    over.
     """
 
     def _harness(self, temp_home: Path) -> EngineHarness:
-        h = EngineHarness(temp_home, strategy="runway", prime_idle_clocks=True)
+        # No cooldown: this class is about the retry backoff, and the flap
+        # leash would otherwise be the thing under test.
+        h = EngineHarness(
+            temp_home,
+            strategy="runway",
+            prime_idle_clocks=True,
+            cooldown_seconds=0.0,
+        )
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
         return h
 
-    def _fleet(self, h: EngineHarness, active_5h: float = 20.0) -> dict:
+    def _fleet(self, h: EngineHarness) -> dict:
         d = lambda n: _iso_at(h.clock.now + n * 86400.0)
         return {
-            "1": _usage7(active_5h, 3, d(7)),
-            # Never opens: the prime keeps missing.
+            # Clock running, so the return is an ordinary move.
+            "1": {
+                "five_hour": {
+                    "pct": 20.0,
+                    "resets_at": _iso_at(h.clock.now + 4 * 3600.0),
+                },
+                "seven_day": {"pct": 3.0, "resets_at": d(7)},
+            },
+            # Never opens: every prime misses.
             "2": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 63.0, "resets_at": d(5)}},
         }
 
-    def _prime_then_return(self, h: EngineHarness, active_5h: float = 20.0) -> None:
-        assert h.tick_with_usage(self._fleet(h, active_5h)) is TickOutcome.SWITCHED
+    def _prime_and_leave(self, h: EngineHarness) -> None:
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
         assert h.active_number() == 2
-        h.clock.advance(15.0)
-        assert h.tick_with_usage(self._fleet(h, active_5h)) is TickOutcome.SWITCHED
+        h.clock.advance(h.engine.settings.prime_hold_seconds + 5.0)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
         assert h.active_number() == 1
 
     def test_it_does_not_retry_straight_away(self, temp_home):
         h = self._harness(temp_home)
-        self._prime_then_return(h)
+        self._prime_and_leave(h)
         h.clock.advance(30.0)
         assert h.tick_with_usage(self._fleet(h)) is TickOutcome.NO_ACTION
 
-    def test_it_does_not_retry_on_an_idle_machine(self, temp_home):
-        """Past the short gap, but nothing has been used since."""
+    def test_it_retries_after_the_first_gap(self, temp_home):
         h = self._harness(temp_home)
-        self._prime_then_return(h)
-        h.clock.advance(PRIME_RETRY_MIN_S + 60.0)
-        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.NO_ACTION
-
-    def test_it_retries_once_work_has_happened(self, temp_home):
-        """Same gap, but the fleet's usage moved, so a clock could have started."""
-        h = self._harness(temp_home)
-        self._prime_then_return(h)
-        h.clock.advance(PRIME_RETRY_MIN_S + 60.0)
-        assert h.tick_with_usage(self._fleet(h, active_5h=45.0)) is TickOutcome.SWITCHED
-        assert h.active_number() == 2
-
-    def test_the_long_bound_retries_regardless(self, temp_home):
-        h = self._harness(temp_home)
-        self._prime_then_return(h)
-        h.clock.advance(PRIME_RETRY_S + 60.0)
+        self._prime_and_leave(h)
+        h.clock.advance(PRIME_RETRY_MIN_S + 30.0)
         assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+    def test_the_second_miss_waits_twice_as_long(self, temp_home):
+        h = self._harness(temp_home)
+        self._prime_and_leave(h)
+        h.clock.advance(PRIME_RETRY_MIN_S + 30.0)
+        self._prime_and_leave(h)
+        # The first gap is no longer enough.
+        h.clock.advance(PRIME_RETRY_MIN_S + 30.0)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.NO_ACTION
+        h.clock.advance(PRIME_RETRY_MIN_S + 30.0)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+
+    def test_an_opened_window_clears_the_history(self, temp_home):
+        """Once it lands, the account is ordinary again."""
+        h = self._harness(temp_home)
+        self._prime_and_leave(h)
+        opened = self._fleet(h)
+        opened["2"]["five_hour"] = {
+            "pct": 3.0,
+            "resets_at": _iso_at(h.clock.now + 5 * 3600.0),
+        }
+        h.clock.advance(30.0)
+        h.tick_with_usage(opened)
+        state = h.engine._read_state()
+        assert "2" not in (state.get("primedAt") or {})
+        assert "2" not in (state.get("primeTries") or {})
