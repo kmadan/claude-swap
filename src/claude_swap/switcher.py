@@ -330,6 +330,8 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
+        # {profile path: (mtime_ns, tier)}, kept by account_seat_tiers.
+        self._seat_tier_cache: dict = {}
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
@@ -1917,6 +1919,16 @@ class ClaudeAccountSwitcher:
     def account_kind_for(self, account_num: str) -> str:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
         return self._account_kind(account_num)
+
+    def account_seat_tiers(self) -> dict[str, str]:
+        """``{slot: userRateLimitTier}`` from each account's stored profile.
+
+        See :mod:`claude_swap.seats`. Cached per profile on its mtime, because
+        the auto-switch engine asks on every tick.
+        """
+        from claude_swap.seats import read_seat_tiers
+
+        return read_seat_tiers(self.backup_dir, self._seat_tier_cache)
 
     def account_email(self, account_num: str) -> str:
         """Stored email for a slot; empty string when unknown."""

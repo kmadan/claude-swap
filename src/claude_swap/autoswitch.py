@@ -51,6 +51,7 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
+from claude_swap.seats import effective_weights
 from claude_swap.settings import (
     AutoSwitchSettings,
     atomic_write_json,
@@ -832,8 +833,10 @@ class AutoSwitchEngine:
         # pass everywhere usage windows are read — decisions, cadence, and
         # reset scheduling must all see the same axes.
         self._models = parse_model_names(settings.model)
-        # Relative seat capacity, read only by the `runway` strategy.
-        self._weights = parse_account_weights(settings.account_weights)
+        # Relative seat capacity, read only by the `runway` strategy: the
+        # multiplier each account's stored seat tier names, with
+        # `autoswitch.accountWeights` overriding. See _seat_weights.
+        self._weights = self._seat_weights()
         # Asked once per tick when present, so a `cswap config set` reaches a
         # running loop instead of waiting for a restart. None keeps the
         # historical behaviour: whatever was passed in, for the life of the
@@ -872,6 +875,22 @@ class AutoSwitchEngine:
 
     # -- state file ---------------------------------------------------------
 
+    def _seat_weights(self) -> dict[str, float]:
+        """``{slot: weight}`` from the stored seat tiers, overridden by settings.
+
+        A premium seat's profile names its multiplier (see
+        :mod:`claude_swap.seats`), so it is weighted without a settings change;
+        ``autoswitch.accountWeights`` still wins for any slot it names. A
+        profile that cannot be read leaves that slot at 1 and never stops the
+        loop.
+        """
+        explicit = parse_account_weights(self.settings.account_weights)
+        try:
+            tiers = self.switcher.account_seat_tiers()
+        except Exception:  # a profile read must not stop the loop
+            tiers = {}
+        return effective_weights(explicit, tiers)
+
     def _refresh_settings(self) -> None:
         """Adopt the current settings, with everything derived from them.
 
@@ -894,7 +913,7 @@ class AutoSwitchEngine:
             return
         self.settings = fresh
         self._models = parse_model_names(fresh.model)
-        self._weights = parse_account_weights(fresh.account_weights)
+        self._weights = self._seat_weights()
         self.switcher.set_poll_policy_inputs(fresh.threshold, self._models)
         # The typo guard reruns against the new model list rather than staying
         # satisfied by the old one.
@@ -1093,6 +1112,9 @@ class AutoSwitchEngine:
         """Evaluate once: poll usage, maybe switch. Never raises."""
         try:
             self._refresh_settings()
+            # Every tick, not only on a settings change: an account added or
+            # logged in again since the last tick brings its seat tier with it.
+            self._weights = self._seat_weights()
             return self._tick_inner()
         except ClaudeSwitchError as e:
             self._emit(ErrorEvent(message=str(e), transient=True))

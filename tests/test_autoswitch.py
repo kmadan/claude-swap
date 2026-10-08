@@ -7176,6 +7176,72 @@ class TestAccountWeights:
         assert h.active_number() == 2
 
 
+def _give_tier(h: EngineHarness, num: int, email: str, tier: str) -> None:
+    """Store slot ``num``'s profile with a seat tier, as a login would."""
+    h.switcher._write_account_config(
+        str(num),
+        email,
+        json.dumps({
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": f"uuid-{num}",
+                "userRateLimitTier": tier,
+            },
+        }),
+    )
+
+
+class TestSeatTierWeights:
+    """A premium seat's stored tier weighs it with no accountWeights entry.
+
+    The harness builds the engine before any account is seeded, so the tier
+    reaches the ranking through the per-tick refresh, as it does when an
+    account is added or logged in again while the loop runs.
+    """
+
+    def _harness(self, temp_home: Path, tier: str | None, **kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="runway", **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        if tier is not None:
+            _give_tier(h, 3, "c@example.com", tier)
+        h.make_live("a@example.com", 1)
+        return h
+
+    @staticmethod
+    def _fleet(h: EngineHarness) -> dict:
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        return {
+            "1": _usage7(95, 50, d(5)),
+            "2": _usage7(10, 40, d(3)),    # 50 usable points over 3 days
+            "3": _usage7(10, 70, d(3)),    # 20 usable; 100 on a 5x seat
+        }
+
+    def test_a_premium_tier_weighs_the_seat(self, temp_home):
+        h = self._harness(temp_home, "default_claude_max_5x")
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert h.engine._weights == {"3": 5.0}
+
+    def test_a_standard_tier_leaves_it_at_one(self, temp_home):
+        h = self._harness(temp_home, "default_raven")
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.engine._weights == {}
+
+    def test_no_tier_in_the_profile_leaves_it_at_one(self, temp_home):
+        h = self._harness(temp_home, None)
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_the_setting_overrides_the_tier(self, temp_home):
+        h = self._harness(temp_home, "default_claude_max_5x", account_weights="3:1")
+        assert h.tick_with_usage(self._fleet(h)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.engine._weights == {"3": 1.0}
+
+
 class TestLiveSettings:
     """A settings_provider makes every knob take effect on the next tick."""
 
