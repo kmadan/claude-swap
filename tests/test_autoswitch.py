@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from dataclasses import replace
@@ -456,17 +457,46 @@ class TestDecisionTable:
         )
         assert exhausted.earliest_reset_at == reset
 
-    def test_cooldown_suppresses_proactive(self, harness):
+    def test_cooldown_does_not_hold_an_account_past_its_limit(self, harness):
+        """Past its limit with a healthy peer, the account leaves at once.
+
+        Holding it for the cooldown spent the reserve between the limit and
+        100%: measured 2026-10-08, 25 of 30 switches that left an account at
+        95%+ had started inside a cooldown, and the account reached 100%.
+        """
         harness.engine._mutate_state(
             lambda s: s.update(lastSwitchAt=harness.clock() - 10)
         )
         outcome = harness.tick_with_usage({
             "1": _usage(95), "2": _usage(10), "3": _usage(10),
         })
-        assert outcome is TickOutcome.NO_ACTION
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+        assert harness.active_number() == 2
+
+    def test_cooldown_still_holds_when_no_account_is_under_its_limit(
+        self, harness, caplog
+    ):
+        """Every account past its limit: a move is a choice, and still paced.
+
+        The hold is logged once for the cooldown, not on every refused tick.
+        """
+        harness.engine._mutate_state(
+            lambda s: s.update(lastSwitchAt=harness.clock() - 10)
+        )
+        usage = {"1": _usage(95), "2": _usage(95), "3": _usage(96)}
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
+            harness.clock.advance(15)
+            assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
         assert [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)] == [
-            "cooldown"
+            "cooldown", "cooldown"
         ]
+        holds = [r for r in caplog.records if "inside the switch cooldown" in r.getMessage()]
+        assert len(holds) == 1
+        assert "account 1 " in holds[0].getMessage()
+        assert harness.active_number() == 1
 
     def test_at_limit_bypasses_cooldown(self, harness):
         harness.engine._mutate_state(

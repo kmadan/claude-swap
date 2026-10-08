@@ -842,6 +842,8 @@ class AutoSwitchEngine:
         # historical behaviour: whatever was passed in, for the life of the
         # engine.
         self._settings_provider = settings_provider
+        # lastSwitchAt of the cooldown already logged by _log_limit_hold.
+        self._limit_hold_logged_for: float | None = None
         # A TUI session override outranks the file, and must survive a reload.
         self._session_threshold: float | None = None
         # Poll plans written by the collector must key on the same threshold/
@@ -1328,26 +1330,6 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        # A priming pass is not flapping, and the cooldown is there to bound
-        # flapping. A prime's purpose is served the moment the window opens, so
-        # holding the engine on that account for another cooldown costs working
-        # time on a worse account and buys nothing. The exemption ends itself:
-        # the move that leaves a primed account is not a prime, so it clears the
-        # flag and the next optional move waits again. It is bounded anyway,
-        # since an account can only be primed once per window.
-        prime_exempt = bool(
-            settings.prime_idle_clocks
-            and trigger == "runway"
-            and state.get("lastSwitchPrimed")
-        )
-        if (
-            trigger in ("proactive", "consume-first", "runway")
-            and not prime_exempt
-            and self._in_cooldown(state)
-        ):
-            self._emit(NoSwitchEvent(reason="cooldown"))
-            return TickOutcome.NO_ACTION
-
         # -- candidate selection ------------------------------------------
         candidates = [
             num
@@ -1366,6 +1348,44 @@ class AutoSwitchEngine:
             if settings.include_api_key_accounts
             else []
         )
+
+        # A priming pass is not flapping, and the cooldown is there to bound
+        # flapping. A prime's purpose is served the moment the window opens, so
+        # holding the engine on that account for another cooldown costs working
+        # time on a worse account and buys nothing. The exemption ends itself:
+        # the move that leaves a primed account is not a prime, so it clears the
+        # flag and the next optional move waits again. It is bounded anyway,
+        # since an account can only be primed once per window.
+        prime_exempt = bool(
+            settings.prime_idle_clocks
+            and trigger == "runway"
+            and state.get("lastSwitchPrimed")
+        )
+        # Leaving an account that has crossed its switch limit is the move the
+        # limit exists for, not an optional one: holding it for a cooldown
+        # spends the reserve between the limit and 100% that is there to cover
+        # the switch. It is exempt while an account under its limit exists to
+        # land on, which keeps it bounded, since an account over its limit is
+        # never a landing target and the next tick cannot move back. With every
+        # account over its limit the move becomes a choice between them, and
+        # the cooldown still paces it.
+        limit_exempt = trigger == "proactive" and any(
+            (h := headroom.get(num)) is not None
+            and h > 0
+            and (100.0 - h) < settings.threshold
+            for num in oauth_candidates + api_key_candidates
+        )
+        if (
+            trigger in ("proactive", "consume-first", "runway")
+            and not prime_exempt
+            and not limit_exempt
+            and self._in_cooldown(state)
+        ):
+            if trigger == "proactive":
+                self._log_limit_hold(current, state)
+            self._emit(NoSwitchEvent(reason="cooldown"))
+            return TickOutcome.NO_ACTION
+
         if (
             trigger == "consume-first"
             and not oauth_candidates
@@ -1764,7 +1784,8 @@ class AutoSwitchEngine:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
                 return self._perform(
-                    num, email, trigger, left_snapshot, note, primed
+                    num, email, trigger, left_snapshot, note, primed,
+                    cooldown_exempt=limit_exempt,
                 )
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
@@ -1796,7 +1817,10 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot, note, primed)
+            return self._perform(
+                num, email, trigger, left_snapshot, note, primed,
+                cooldown_exempt=limit_exempt,
+            )
 
         if systemic or transient_failure:
             self._emit(
@@ -2867,6 +2891,7 @@ class AutoSwitchEngine:
         left: tuple[float | None, float],
         note: str = "",
         primed: bool = False,
+        cooldown_exempt: bool = False,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2890,11 +2915,13 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            # Same exemption as the tick's check, on the same state: deciding
-            # to move and then refusing it here would strand the engine on the
-            # primed account for a cooldown after its window opened.
+            # Same exemptions as the tick's check: deciding to move and then
+            # refusing it here would strand the engine on the primed account,
+            # or on an account past its limit. The over-limit one is passed in,
+            # since it rests on the usage the tick ranked, not on this state.
             if (
                 trigger in ("proactive", "consume-first", "runway")
+                and not cooldown_exempt
                 and not (
                     self.settings.prime_idle_clocks
                     and trigger == "runway"
@@ -2976,6 +3003,24 @@ class AutoSwitchEngine:
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
+
+    def _log_limit_hold(self, current: str, state: dict) -> None:
+        """Log, once per cooldown, that an account past its limit is being held.
+
+        Reached only when no other account is under its limit, since one that
+        is lifts the cooldown (see the tick). The console shows every refused
+        tick; the log gets one line per cooldown, so it records the hold
+        without repeating it every tick.
+        """
+        since = state.get("lastSwitchAt")
+        if since == self._limit_hold_logged_for:
+            return
+        self._limit_hold_logged_for = since
+        _logger.warning(
+            "Holding account %s inside the switch cooldown although it is past "
+            "its switch limit: no other account is under its limit",
+            current,
+        )
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")
