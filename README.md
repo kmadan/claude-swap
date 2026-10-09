@@ -118,6 +118,42 @@ Defaults like the threshold and cooldown are configurable with `cswap config set
 
 </details>
 
+### Resume sessions a usage limit stopped
+
+When a usage limit stops a Claude Code session, Claude Code continues it only after that limit resets, and a session hosted by an editor extension may not continue on its own at all. `cswap rewake` is a Claude Code hook that continues the session as soon as the account `cswap auto` has active is under its switch limit, which after a switch is usually within seconds.
+
+Register it in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "StopFailure": [
+      {
+        "matcher": "rate_limit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cswap rewake; [ $? -eq 42 ] && exit 2 || exit 0",
+            "asyncRewake": true,
+            "timeout": 21600
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Use the full path to `cswap` when the editor's environment does not have it on `PATH`. Claude Code starts the hook in the background when a turn ends on a rate limit. Once the active account is under its limit, `cswap rewake` exits 42 and the command turns that into the exit code 2 that wakes the session with a reminder to continue the task; any other exit leaves the session as it was. The wake status is not 2 itself because a usage error exits 2, and so does a cswap version without this command; mapped this way, such a failure never wakes a session, and so cannot wake it in a loop.
+
+- The account that was active at the stop counts only once a reading taken after the stop shows it under its limit. Another account counts on any reading from the last 15 minutes. The hook reads the usage store that `cswap auto` keeps current and sends no usage requests of its own.
+- A session that has replied, or received a typed prompt, since the stop is left alone, and a newer stop of the same session takes over from the older hook.
+- Wakes are at least 10 seconds apart (`--spacing`), so sessions stopped together do not reach the new account at the same moment.
+- A session that stops again after two wakes within 30 minutes is left for you, so a wake cannot loop.
+- It gives up after 5 h 45 min (`--max-wait`), inside the 6-hour `timeout` above. Every decision is logged to `claude-swap.log` as a `Rewake:` line.
+
+A woken session sends its whole conversation again, so waking many large sessions at once spends usage quickly.
+
 ### Run multiple accounts at the same time (session mode)
 
 Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.

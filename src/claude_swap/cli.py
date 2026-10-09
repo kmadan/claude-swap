@@ -979,11 +979,65 @@ def _menubar_service(args) -> int:
     return 0
 
 
+def _rewake_command(argv: list[str]) -> None:
+    """Handle `cswap rewake`, the Claude Code StopFailure hook.
+
+    Reads the hook input on stdin, waits for an account under its limit, and
+    exits with ``rewake.WAKE_EXIT_CODE`` and the reminder on stderr; the
+    registered command maps that status to the 2 that wakes the session (see
+    :mod:`claude_swap.rewake`). Nothing else may reach stderr: on a wake Claude
+    Code hands all of it to Claude.
+    """
+    from claude_swap import rewake
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} rewake",
+        description=(
+            "Claude Code StopFailure hook: wake a session stopped by a usage "
+            "limit once the active account is under its limit. Exits 42 to "
+            "wake; register it with asyncRewake as "
+            "'cswap rewake; [ $? -eq 42 ] && exit 2 || exit 0' (see the README)."
+        ),
+    )
+    parser.add_argument(
+        "--errors",
+        default=",".join(rewake.DEFAULT_ERRORS),
+        help="comma-separated StopFailure error types to act on (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--poll", type=float, default=rewake.DEFAULT_POLL_S,
+        help="seconds between checks of the usage store (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--spacing", type=float, default=rewake.DEFAULT_SPACING_S,
+        help="minimum seconds between two wakes (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-wait", type=float, default=rewake.DEFAULT_MAX_WAIT_S,
+        help="give up after this many seconds (default: %(default)s)",
+    )
+    args = parser.parse_args(argv)
+    code, message = rewake.hook_main(
+        sys.stdin.read(),
+        errors=tuple(e.strip() for e in args.errors.split(",") if e.strip()),
+        poll_s=args.poll,
+        spacing_s=args.spacing,
+        max_wait_s=args.max_wait,
+    )
+    if code == rewake.WAKE_EXIT_CODE and message:
+        print(message, file=sys.stderr)
+    sys.exit(code)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
     _use_native_tls()
     argv = sys.argv[1:]
+    # A hook: no theme probe, nothing on the terminal.
+    if argv and argv[0] == "rewake":
+        _rewake_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
         # `run` execs a child that takes over the terminal, and `--json`
@@ -1063,6 +1117,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s rewake                     Claude Code hook: resume a limit-stopped session
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
