@@ -58,6 +58,7 @@ _SUBCOMMAND_FLAGS = {
     "rm": "--remove-account",
     "disable": "--disable-account",
     "enable": "--enable-account",
+    "refresh": "--refresh-account",
     "export": "--export",
     "import": "--import",
     "purge": "--purge",
@@ -1043,6 +1044,7 @@ Commands:
   %(prog)s help                       show this help
   %(prog)s list                       list managed accounts
   %(prog)s status                     show current account
+  %(prog)s refresh <num|email>        fetch one account's usage now
   %(prog)s switch                     rotate to the next account
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        add the current account
@@ -1223,6 +1225,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
     group.add_argument(
+        "--refresh-account",
+        metavar="NUM|EMAIL",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
         "--list",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1305,6 +1312,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.remove_account is not None
         or args.disable_account is not None
         or args.enable_account is not None
+        or args.refresh_account is not None
         or args.switch_to is not None
         or args.export is not None
         or args.import_ is not None
@@ -1401,6 +1409,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             switcher.set_account_disabled(args.disable_account, True)
         elif args.enable_account is not None:
             switcher.set_account_disabled(args.enable_account, False)
+        elif args.refresh_account is not None:
+            switcher.refresh_account_usage(args.refresh_account)
         elif args.list:
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,

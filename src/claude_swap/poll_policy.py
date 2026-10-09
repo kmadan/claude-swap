@@ -87,6 +87,11 @@ MIN_INTERVAL_S = 180.0
 # on top of steady traffic is absorbed by the post-429 floor below.
 URGENT_INTERVAL_S = 60.0
 
+# ``cswap refresh`` fetches one account on request, ahead of its plan. That is
+# still a request against the account's budget, so the command waits until the
+# last read is at least this old: the same minute urgent mode allows.
+MANUAL_REFRESH_MIN_AGE_S = URGENT_INTERVAL_S
+
 # Decay ceilings for an account whose usage is not moving: the active account
 # stays reasonably fresh, an idle alternate drifts out to ten minutes.
 ACTIVE_MAX_INTERVAL_S = 300.0

@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -254,6 +255,39 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     if entry.last_error:
         detail += f" ({ERROR_NOTES.get(entry.last_error, entry.last_error)})"
     return [dimmed(detail)]
+
+
+def refresh_refusal(entry: UsageEntry, now: float) -> str | None:
+    """Why ``cswap refresh`` should not fetch this account now, or None.
+
+    An on-request fetch still spends the account's usage-endpoint budget,
+    about 28-30 requests an hour (see :mod:`claude_swap.poll_policy`), and a
+    429 holds the account's cadence back for up to an hour. The command
+    declines where a request is most likely to be wasted or to extend a
+    block: a failure backoff still running, a 429 within the past hour, or a
+    read within the last minute.
+    """
+    if entry.in_backoff(now):
+        until = time.strftime("%H:%M:%S", time.localtime(entry.backoff_until))
+        return f"it is backing off after a failed fetch until {until}"
+    if (
+        entry.last_429_at is not None
+        and now - entry.last_429_at < poll_policy.RECENT_429_WINDOW_S
+    ):
+        since = now - entry.last_429_at
+        clears = math.ceil((poll_policy.RECENT_429_WINDOW_S - since) / 60)
+        return (
+            f"the usage endpoint rate-limited it {int(since // 60)} min ago, and "
+            f"a request now could extend the block; try again in {clears} min"
+        )
+    if (
+        entry.fetched_at is not None
+        and now - entry.fetched_at < poll_policy.MANUAL_REFRESH_MIN_AGE_S
+    ):
+        age = now - entry.fetched_at
+        wait = math.ceil(poll_policy.MANUAL_REFRESH_MIN_AGE_S - age)
+        return f"it was read {int(age)}s ago; try again in {wait}s"
+    return None
 
 
 def _label_token_status(source: str, credentials: str) -> str | None:
@@ -945,6 +979,59 @@ class ClaudeAccountSwitcher:
             os.chmod(config_file, 0o600)
 
     # -- public accessors for session mode (claude_swap.session) ---------
+
+    def refresh_account_usage(self, identifier: str) -> None:
+        """``cswap refresh``: fetch one account's usage now, ahead of its plan.
+
+        The fetch runs through the same collector as ``cswap list``, so token
+        handling, recording and the next poll plan are unchanged. The slot is
+        reserved with ``force``, which skips the serve window and the poll plan
+        but still honours a dead login, failure backoff and an in-flight fetch.
+        :func:`refresh_refusal` declines before any request is sent.
+
+        Raises:
+            AccountNotFoundError: no such account, or no stored login for it.
+            ValidationError: declined, or the fetch produced no new reading.
+        """
+        account_num, email, _org = self.resolve_account(identifier)
+        info = next(
+            (i for i in self._build_accounts_info() if str(i[0]) == account_num),
+            None,
+        )
+        if info is None:
+            raise AccountNotFoundError(
+                f"Account-{account_num} has no stored login to refresh"
+            )
+        label = f"Account-{account_num} ({email})"
+        identities = {account_num: (info[1], info[3] or "")}
+        _threshold, models = self._poll_policy_inputs()
+        before = self._usage_store.entries(identities, models)[account_num]
+        refusal = refresh_refusal(before, self._usage_store.clock())
+        if refusal:
+            raise ValidationError(f"{label} not refreshed: {refusal}")
+
+        entry = self._collect_usage_entries(
+            [info], fetch={account_num}, force=True
+        )[account_num]
+        refreshed = (
+            entry.sentinel is None
+            and entry.fetched_at is not None
+            and entry.fetched_at != before.fetched_at
+        )
+        print(f"{accent('Refreshed') if refreshed else muted('Not refreshed')} {label}")
+        for line in _usage_entry_lines(entry):
+            print(f"     {line}")
+        if refreshed:
+            return
+        if entry.sentinel is not None:
+            reason = SENTINEL_NOTES.get(entry.sentinel, entry.sentinel)
+        elif entry.last_error and entry.last_attempt_at != before.last_attempt_at:
+            reason = "the fetch failed: " + ERROR_NOTES.get(
+                entry.last_error, entry.last_error
+            )
+        else:
+            reason = "another fetch of this account is in flight; try again shortly"
+        raise ValidationError(f"{label} not refreshed: {reason}")
 
     def resolve_account(self, identifier: str) -> tuple[str, str, str]:
         """Resolve NUM|EMAIL to (account_num, email, organizationUuid).
@@ -4964,6 +5051,7 @@ class ClaudeAccountSwitcher:
         fetch: set[str] | None = None,
         *,
         scheduled: bool = False,
+        force: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
@@ -4975,7 +5063,10 @@ class ClaudeAccountSwitcher:
         fresh. Final eligibility —
         freshness, backoff, claims, plans — is decided atomically by
         ``UsageStore.reserve``, so concurrent collectors can never
-        double-fetch a slot. After each successful fetch the adapted cadence
+        double-fetch a slot. ``force`` (with an explicit ``fetch`` set, for
+        ``cswap refresh``) reserves past freshness and the poll plan while the
+        quarantine, backoff and claim gates still apply. After each successful
+        fetch the adapted cadence
         is persisted (``_persist_poll_plans``), making every surface inherit
         the same plan. A failed fetch only updates the entry's error/backoff
         fields, so the last-good measurement keeps being served
@@ -5040,6 +5131,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=False,
                 repair_overslept=scheduled,
+                force=force,
             )
         # An expired ACTIVE credential that cannot reach the fetch path (and
         # its locked refresh) this tick — failure backoff, a concurrent
