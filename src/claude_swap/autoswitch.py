@@ -588,6 +588,64 @@ def _window_pcts(
     }
 
 
+# Two readings further apart than this say little about the current burn: the
+# account may have sat idle in between, or a burst may already be over.
+_PROJECTION_MAX_SPAN_S = 900.0
+
+
+def _projected_crossing(
+    prev: tuple[float, dict] | None,
+    latest: tuple[float, dict] | None,
+    horizon_s: float,
+    weight: float = 1.0,
+    threshold: float = 90.0,
+) -> tuple[str, float, float, float, float] | None:
+    """The window projected to reach its switch limit within ``horizon_s``.
+
+    ``prev`` and ``latest`` are ``(fetched_at, usage)`` readings of one account,
+    usage holding raw window percentages. Each window the decision reads is
+    extrapolated at the rate between the two readings, against its own limit
+    scaled for the seat, which is how the decision judges it. Raw percentages
+    are used rather than the restated ones, since the restatement compresses
+    the last points below a limit into one value and would hide the climb.
+
+    Returns ``(label, pct_now, projected, points_per_minute, limit)`` for the
+    first window that would reach its limit, or None when a reading is missing,
+    the two are too far apart, the window is flat or falling, or already past
+    its limit (the ordinary trigger handles that).
+    """
+    if not prev or not latest:
+        return None
+    (t0, u0), (t1, u1) = prev, latest
+    span = t1 - t0
+    if span <= 0 or span > _PROJECTION_MAX_SPAN_S:
+        return None
+    limits, _file_threshold = oauth.window_thresholds()
+    selected = oauth.decision_windows()
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        if label not in selected:
+            continue
+        w0 = u0.get(key) if isinstance(u0, dict) else None
+        w1 = u1.get(key) if isinstance(u1, dict) else None
+        if not (isinstance(w0, dict) and isinstance(w1, dict)):
+            continue
+        p0, p1 = w0.get("pct"), w1.get("pct")
+        if not (isinstance(p0, (int, float)) and isinstance(p1, (int, float))):
+            continue
+        rate = (p1 - p0) / span
+        if rate <= 0:
+            continue
+        limit = (
+            oauth.scaled_limit(limits[label], weight) if label in limits else threshold
+        )
+        if p1 >= limit:
+            continue
+        projected = p1 + rate * horizon_s
+        if projected >= limit:
+            return label, float(p1), projected, rate * 60.0, limit
+    return None
+
+
 # Reset math moved to poll_policy with the cadence numbers; aliased for the
 # engine's sleep scheduling and the test suite.
 _limiting_reset_ts = poll_policy.limiting_reset_ts
@@ -844,6 +902,11 @@ class AutoSwitchEngine:
         self._settings_provider = settings_provider
         # lastSwitchAt of the cooldown already logged by _log_limit_hold.
         self._limit_hold_logged_for: float | None = None
+        # The active account's last two distinct readings, (fetched_at, usage),
+        # for the burn rate the early switch projects; and the reading whose
+        # projection was last logged.
+        self._readings: dict[str, list[tuple[float, dict]]] = {}
+        self._early_logged_for: dict[str, float] = {}
         # A TUI session override outranks the file, and must survive a reload.
         self._session_threshold: float | None = None
         # Poll plans written by the collector must key on the same threshold/
@@ -1175,6 +1238,7 @@ class AutoSwitchEngine:
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
+        self._note_reading(current, entries.get(current))
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1214,12 +1278,20 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+        # A limit crossing projected before the next read; see _early_crossing.
+        early = None
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                if settings.strategy == "runway":
+                early = self._early_crossing(current, entries.get(current), settings)
+                if early is not None:
+                    # Burning fast enough to pass its limit before the next
+                    # read could show it: leave now, by the rules for an
+                    # account past its limit, cooldown exemption included.
+                    trigger = "proactive"
+                elif settings.strategy == "runway":
                     # Below the threshold and still working, but sitting on an
                     # account with little runway spends the one that would have
                     # bridged a gap later. Candidate selection decides whether
@@ -1381,7 +1453,7 @@ class AutoSwitchEngine:
             and not limit_exempt
             and self._in_cooldown(state)
         ):
-            if trigger == "proactive":
+            if trigger == "proactive" and early is None:
                 self._log_limit_hold(current, state)
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
@@ -1581,13 +1653,14 @@ class AutoSwitchEngine:
             now=decided_now,
         )
 
-        if trigger in ("consume-first", "runway") and ordered:
+        if (trigger in ("consume-first", "runway") or early is not None) and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
             # inside the ESCALATION_MARGIN_PCT band (flat-traffic invariant).
             # A switch is imminent, so spend the fetches now and re-decide on
-            # fresh data.
+            # fresh data. An early switch can fire below that band too, at a
+            # fast enough burn, so it takes the same refetch.
             # reserve() serves just-fetched accounts from the store, so this
             # is cheap in-tick and plan-bounded across ticks. The trigger is
             # deliberately NOT re-classified if the fresh active crossed the
@@ -1615,13 +1688,16 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger not in (
-            "consume-first",
-            "runway",
+        if (
+            not ordered
+            and api_key_candidates
+            and trigger not in ("consume-first", "runway")
+            and early is None
         ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
+            # Nor for an early switch, which is not yet a move that must be made.
             ordered = api_key_candidates
 
         if not ordered:
@@ -1693,6 +1769,21 @@ class AutoSwitchEngine:
                     NoSwitchEvent(
                         reason="already-consuming-soonest",
                         detail="no sooner-resetting account with room to spare",
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            if early is not None:
+                # Nothing under its limit to move to. The active account is
+                # still under its own, so staying is safe for now, and neither
+                # "blocked" nor "all exhausted" would be true; if it crosses,
+                # the ordinary trigger takes over on that reading.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="early-switch-no-target",
+                        detail=(
+                            "burning toward its limit, but no account under "
+                            "its limit to move to"
+                        ),
                     )
                 )
                 return TickOutcome.NO_ACTION
@@ -2410,7 +2501,18 @@ class AutoSwitchEngine:
                 # dropped, but only while the active account is over its limit
                 # and burning toward a hard stop: `runway` below the threshold
                 # is an optimisation, and undoing a move for it would flap.
-                if by_runway and trigger == "proactive":
+                # An early switch is taken while the active account is still
+                # under its limit, so the account it would undo to must be
+                # under its own: one past it is worse than staying.
+                active_past_limit = (
+                    active_headroom is not None
+                    and (100.0 - active_headroom) >= settings.threshold
+                )
+                if (
+                    by_runway
+                    and trigger == "proactive"
+                    and (active_past_limit or (100.0 - h) < settings.threshold)
+                ):
                     barred.append(((0, -(h or 0.0)), num))
                 continue
             reset_ts = (
@@ -2662,6 +2764,11 @@ class AutoSwitchEngine:
                 )
             else:
                 key = (-h,)
+            if trigger in ("at-limit", "failover") and not all_above:
+                # An escape takes any account with headroom, but one still
+                # under its limit first: landing past a limit buys only the
+                # minutes until that account needs escaping in turn.
+                key = (0 if (100.0 - h) < settings.threshold else 1, *key)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         if prime and trigger == "runway":
@@ -2704,9 +2811,11 @@ class AutoSwitchEngine:
         active usage unknown (failover must not run on stale candidate data).
         At-limit, proactive, and ordinary unknown-usage failover selection
         never runs on the pre-escalation snapshot — those triggers imply the
-        escalation condition (the deliberate exception: an owned-and-expired
+        escalation condition (the deliberate exceptions: an owned-and-expired
         active is excluded above, so a post-idle-hold failover can run
-        without escalating). The consume-first trigger can fire outside the
+        without escalating; and an early switch, see ``_early_crossing``, can
+        fire below the band and takes the consume-first re-verification
+        described next). The consume-first trigger can fire outside the
         escalation band, so it instead decides *provisionally* on the stored
         snapshot and, only when a switch would fire, re-runs an escalated
         collection and re-verifies the choice in ``_tick_inner`` (two-phase
@@ -3003,6 +3112,66 @@ class AutoSwitchEngine:
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
+
+    def _note_reading(self, num: str, entry) -> None:
+        """Keep the last two distinct readings of the active account.
+
+        Kept for the current stint only. A rate measured while an account was
+        active says nothing about the time it then spent inactive, and the
+        horizon extrapolates from the latest reading, so returning to an
+        account starts its history again rather than projecting an old burn
+        across the time away.
+        """
+        if num not in self._readings:
+            self._readings = {num: []}
+        if (
+            entry is None
+            or entry.fetched_at is None
+            or not isinstance(entry.last_good, dict)
+        ):
+            return
+        history = self._readings[num]
+        if history and entry.fetched_at <= history[-1][0]:
+            return
+        history.append((entry.fetched_at, entry.last_good))
+        del history[:-2]
+
+    def _early_crossing(self, num: str, entry, settings: AutoSwitchSettings):
+        """A limit crossing projected before the active account's next read.
+
+        The horizon runs from the latest reading to the account's planned next
+        read, plus one tick, the longest the engine can take to act on that
+        read. It is measured from the reading rather than from now, because the
+        burn has continued since the reading was taken. At a burst of 11 points
+        a minute the 8-point reserve under a 92% limit lasts about 40 seconds,
+        less than the fastest read interval, so a read can miss the band
+        between the limit and 100% entirely. Logged once per reading.
+        """
+        history = self._readings.get(num) or []
+        if len(history) < 2 or entry is None:
+            return None
+        read_at = history[-1][0]
+        next_read = (
+            entry.next_poll_at
+            if entry.next_poll_at is not None
+            else read_at + poll_policy.URGENT_INTERVAL_S
+        )
+        # An overdue read happens no sooner than now.
+        horizon = max(next_read, self.clock()) - read_at + settings.interval_seconds
+        crossing = _projected_crossing(
+            history[-2], history[-1], horizon,
+            self._weights.get(num, 1.0), settings.threshold,
+        )
+        if crossing is not None and self._early_logged_for.get(num) != read_at:
+            self._early_logged_for[num] = read_at
+            label, pct, _projected, rate, limit = crossing
+            _logger.info(
+                "Early switch triggered on account %s: %s at %.0f%% is rising "
+                "%.1f points a minute and would reach its %.0f%% limit within "
+                "%.0fs of that reading, before the next read could show it",
+                num, label, pct, rate, limit, horizon,
+            )
+        return crossing
 
     def _log_limit_hold(self, current: str, state: dict) -> None:
         """Log, once per cooldown, that an account past its limit is being held.

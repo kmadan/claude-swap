@@ -29,6 +29,7 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
+    _projected_crossing,
     _recovery_is_useful,
     _weekly_runway,
     pct_label,
@@ -8101,3 +8102,328 @@ class TestPrimeRetryBacksOff:
         state = h.engine._read_state()
         assert "2" not in (state.get("primedAt") or {})
         assert "2" not in (state.get("primeTries") or {})
+
+
+# The live configuration the early switch was measured against.
+_LIVE_LIMITS = ({"5h": 92.0, "7d": 97.0}, 90.0)
+
+
+class TestProjectedCrossing:
+    """The burn projection an early switch acts on.
+
+    Numbers from a measured run on 2026-10-09: the active account read 62%,
+    then 85% 195 s later, then 88%, then 100% 64 s after that.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _limits(self, monkeypatch):
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: _LIVE_LIMITS)
+        monkeypatch.setattr(
+            oauth, "decision_windows", lambda: frozenset({"5h", "7d"})
+        )
+
+    def test_a_burn_that_passes_the_limit_before_the_next_read(self):
+        crossing = _projected_crossing((0.0, _usage(62)), (195.0, _usage(85)), 75.0)
+        assert crossing is not None
+        label, pct, projected, rate, limit = crossing
+        assert (label, pct, limit) == ("5h", 85.0, 92.0)
+        assert rate == pytest.approx(23 / 195 * 60)
+        assert projected == pytest.approx(85 + 23 / 195 * 75)
+
+    def test_a_flat_window_projects_nothing(self):
+        assert _projected_crossing((0.0, _usage(85)), (195.0, _usage(85)), 75.0) is None
+
+    def test_a_slow_climb_stays_under_the_limit(self):
+        assert _projected_crossing((0.0, _usage(80)), (195.0, _usage(82)), 75.0) is None
+
+    def test_a_window_that_reset_is_not_a_burn(self):
+        assert _projected_crossing((0.0, _usage(85)), (195.0, _usage(3)), 75.0) is None
+
+    def test_readings_too_far_apart_say_nothing(self):
+        assert _projected_crossing((0.0, _usage(62)), (1000.0, _usage(85)), 75.0) is None
+
+    def test_one_reading_is_not_a_rate(self):
+        assert _projected_crossing(None, (195.0, _usage(85)), 75.0) is None
+        assert _projected_crossing((195.0, _usage(62)), (195.0, _usage(85)), 75.0) is None
+
+    def test_a_window_past_its_limit_is_left_to_the_ordinary_trigger(self):
+        assert _projected_crossing((0.0, _usage(91)), (60.0, _usage(93)), 75.0) is None
+
+    def test_a_premium_seat_projects_against_its_scaled_limit(self):
+        # 92 on a 5x seat is 98: the same burn that crosses 92 stops short of it.
+        before, after = (0.0, _usage(62)), (195.0, _usage(85))
+        assert _projected_crossing(before, after, 75.0, weight=5.0) is None
+        crossing = _projected_crossing(
+            (0.0, _usage(90)), (60.0, _usage(96)), 75.0, weight=5.0
+        )
+        assert crossing is not None and crossing[4] == 98.0
+
+    def test_the_weekly_window_is_projected_too(self):
+        crossing = _projected_crossing(
+            (0.0, _usage7(10, 95)), (60.0, _usage7(10, 96)), 75.0
+        )
+        assert crossing is not None
+        assert (crossing[0], crossing[4]) == ("7d", 97.0)
+
+    def test_a_window_the_decision_ignores_is_not_projected(self, monkeypatch):
+        monkeypatch.setattr(oauth, "decision_windows", lambda: frozenset({"5h"}))
+        assert (
+            _projected_crossing((0.0, _usage7(10, 95)), (60.0, _usage7(10, 96)), 75.0)
+            is None
+        )
+
+    def test_a_window_without_its_own_limit_uses_the_threshold(self, monkeypatch):
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: ({}, 90.0))
+        crossing = _projected_crossing(
+            (0.0, _usage(80)), (60.0, _usage(86)), 75.0, threshold=90.0
+        )
+        assert crossing is not None and crossing[4] == 90.0
+
+
+class TestEarlySwitchOnProjectedBurn:
+    """Leave an account whose burn would pass its limit before the next read.
+
+    Measured 2026-10-09: the active account read 62%, then 85% 195 s later,
+    then 88%, then 100% 64 s after that. The 8 points between its 92% limit and
+    exhaustion lasted under a minute at that burn, less than the 60 s between
+    reads, so no reading landed between the limit and 100% and the engine
+    switched only after the account was exhausted.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _limits(self, monkeypatch):
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: _LIVE_LIMITS)
+
+    def _harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, interval_seconds=15.0, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    @staticmethod
+    def _entries(h: EngineHarness, active: dict, peers: dict) -> dict:
+        now = h.clock.now
+        entries = {
+            # The active account's next read is planned 60 s out, the urgent
+            # cadence it holds while climbing near its limit.
+            "1": UsageEntry(
+                last_good=active, fetched_at=now, age_s=0.0, next_poll_at=now + 60.0
+            ),
+        }
+        entries.update({num: _entry_for(value, now) for num, value in peers.items()})
+        return entries
+
+    def _tick(self, h: EngineHarness, pct: float) -> TickOutcome:
+        return h.tick_with_entries(
+            self._entries(h, _usage(pct), {"2": _usage(10), "3": _usage(30)})
+        )
+
+    def test_a_burn_toward_the_limit_switches_before_it(self, temp_home, caplog):
+        h = self._harness(temp_home)
+        assert self._tick(h, 62) is TickOutcome.NO_ACTION
+        h.clock.advance(195.0)
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            assert self._tick(h, 85) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = [e for e in h.events if isinstance(e, SwitchEvent)][-1]
+        assert switch.trigger == "proactive"
+        early = [
+            r.getMessage()
+            for r in caplog.records
+            if "Early switch triggered on account 1" in r.getMessage()
+        ]
+        assert len(early) == 1
+        assert "5h at 85%" in early[0] and "92% limit" in early[0]
+
+    def test_the_horizon_counts_from_the_reading_not_the_tick(self, temp_home):
+        """A reading acted on 50 s late has 50 s less warning left, not more."""
+        h = self._harness(temp_home)
+        assert self._tick(h, 62) is TickOutcome.NO_ACTION
+        h.clock.advance(245.0)
+        read_at = h.clock.now - 50.0
+        entries = {
+            "1": UsageEntry(
+                last_good=_usage(85),
+                fetched_at=read_at,
+                age_s=50.0,
+                next_poll_at=read_at + 60.0,
+            ),
+            "2": _entry_for(_usage(10), h.clock.now),
+            "3": _entry_for(_usage(30), h.clock.now),
+        }
+        assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_returning_to_an_account_starts_its_history_again(self, temp_home):
+        """A rate measured while it was active says nothing about its time away."""
+        h = self._harness(temp_home)
+        t = h.clock.now
+        h.engine._note_reading("1", _entry_for(_usage(62), t))
+        h.engine._note_reading("1", _entry_for(_usage(85), t + 195.0))
+        h.engine._note_reading("2", _entry_for(_usage(10), t + 210.0))
+        back = _entry_for(_usage(85), t + 195.0)
+        h.engine._note_reading("1", back)
+        h.clock.advance(500.0)
+        assert h.engine._early_crossing("1", back, h.engine.settings) is None
+
+    def test_a_flat_account_stays(self, temp_home):
+        h = self._harness(temp_home)
+        assert self._tick(h, 84) is TickOutcome.NO_ACTION
+        h.clock.advance(195.0)
+        assert self._tick(h, 85) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_a_single_reading_never_switches_early(self, temp_home):
+        h = self._harness(temp_home)
+        assert self._tick(h, 85) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def _runway_tick(self, h: EngineHarness, pct: float) -> TickOutcome:
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        return h.tick_with_entries(
+            self._entries(
+                h,
+                _usage7(pct, 50, d(5)),
+                {"2": _usage7(10, 40, d(3)), "3": _usage7(10, 70, d(3))},
+            )
+        )
+
+    def _arrived_moments_ago(self, h: EngineHarness) -> None:
+        h.engine._mutate_state(
+            lambda s: s.update({"lastSwitchAt": h.clock.now, "lastSwitchTo": "1"})
+        )
+        h.clock.advance(20.0)
+
+    def test_the_early_switch_is_not_held_by_the_cooldown(self, temp_home):
+        h = self._harness(temp_home, strategy="runway")
+        self._arrived_moments_ago(h)
+        assert self._runway_tick(h, 62) is TickOutcome.NO_ACTION
+        h.clock.advance(195.0)  # 215 s into a 300 s cooldown
+        assert self._runway_tick(h, 85) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_without_the_burn_the_cooldown_still_holds(self, temp_home):
+        h = self._harness(temp_home, strategy="runway")
+        self._arrived_moments_ago(h)
+        assert self._runway_tick(h, 62) is TickOutcome.NO_ACTION
+        h.clock.advance(195.0)
+        assert self._runway_tick(h, 63) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert "cooldown" in [
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ]
+
+    def test_with_nowhere_under_its_limit_it_holds_and_logs_once(
+        self, temp_home, caplog
+    ):
+        h = self._harness(temp_home)
+        peers = {"2": _usage(95), "3": _usage(96)}
+        assert h.tick_with_entries(self._entries(h, _usage(60), peers)) is (
+            TickOutcome.NO_ACTION
+        )
+        h.clock.advance(120.0)
+        burning = self._entries(h, _usage(85), peers)
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            assert h.tick_with_entries(burning) is TickOutcome.NO_ACTION
+            h.clock.advance(15.0)
+            assert h.tick_with_entries(burning) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons[-2:] == ["early-switch-no-target"] * 2
+        early = [
+            r for r in caplog.records
+            if "Early switch triggered on account 1" in r.getMessage()
+        ]
+        assert len(early) == 1
+
+    def _rank_args(self, h: EngineHarness, active_pct: float, peer_pct: float) -> dict:
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        usage = {
+            "1": _usage7(active_pct, 26, d(6)),
+            "2": _usage7(peer_pct, 42, d(5)),   # the account just left
+        }
+        headroom = {n: oauth.account_headroom(u) for n, u in usage.items()}
+        return dict(
+            trigger="proactive",
+            consume_first=False,
+            by_runway=True,
+            oauth_candidates=["2"],
+            usage=usage,
+            headroom=headroom,
+            current="1",
+            active_headroom=headroom["1"],
+            settings=h.engine.settings,
+            now=h.clock.now,
+        )
+
+    def test_an_early_switch_does_not_undo_to_an_account_past_its_limit(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, strategy="runway")
+        ordered, *_ = h.engine._rank_candidates(
+            no_return="2", **self._rank_args(h, 85.0, 95.0)
+        )
+        assert ordered == []
+
+    def test_an_early_switch_may_undo_to_an_account_under_its_limit(self, temp_home):
+        h = EngineHarness(temp_home, strategy="runway")
+        ordered, *_ = h.engine._rank_candidates(
+            no_return="2", **self._rank_args(h, 85.0, 12.0)
+        )
+        assert ordered == ["2"]
+
+    def test_past_its_limit_the_undo_still_takes_any_headroom(self, temp_home):
+        """The incident the last resort exists for is unchanged."""
+        h = EngineHarness(temp_home, strategy="runway")
+        ordered, *_ = h.engine._rank_candidates(
+            no_return="2", **self._rank_args(h, 95.0, 95.0)
+        )
+        assert ordered == ["2"]
+
+
+class TestEscapePrefersAnAccountUnderItsLimit:
+    """An at-limit escape lands under a limit whenever an account is.
+
+    Measured 2026-10-09: the exhausted account's escape went to a 5x seat at
+    99%, past its own 98% limit, because escapes skip the landing check and the
+    runway ranking put that seat's weekly budget first. Another account at 6%
+    was available, and the engine left the 5x seat 14.6 s later.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _limits(self, monkeypatch):
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: _LIVE_LIMITS)
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="runway", account_weights="2:5")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_the_escape_takes_the_account_under_its_limit(self, temp_home):
+        h = self._harness(temp_home)
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 40, d(6)),
+            "2": _usage7(99, 17, d(3.6)),   # 5x seat, past its 98% limit
+            "3": _usage7(6, 58, d(5)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        switch = [e for e in h.events if isinstance(e, SwitchEvent)][-1]
+        assert switch.trigger == "at-limit"
+
+    def test_with_nothing_under_a_limit_it_still_escapes(self, temp_home):
+        h = self._harness(temp_home)
+        d = lambda n: _iso_at(h.clock.now + n * 86400.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 40, d(6)),
+            "2": _usage7(99, 17, d(3.6)),
+            "3": _usage7(95, 58, d(5)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() in (2, 3)
