@@ -8338,6 +8338,35 @@ class TestEarlySwitchOnProjectedBurn:
         ]
         assert len(early) == 1
 
+    def test_with_no_other_account_it_holds_rather_than_blocks(self, temp_home):
+        h = EngineHarness(temp_home, interval_seconds=15.0)
+        h.seed(1, "a@example.com")
+        h.make_live("a@example.com", 1)
+        assert h.tick_with_entries(self._entries(h, _usage(62), {})) is (
+            TickOutcome.NO_ACTION
+        )
+        h.clock.advance(195.0)
+        assert h.tick_with_entries(self._entries(h, _usage(85), {})) is (
+            TickOutcome.NO_ACTION
+        )
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons[-1] == "early-switch-no-target"
+        assert h.engine._blocked_wait_long is False
+
+    def test_with_no_readable_peer_it_holds_rather_than_blocks(self, temp_home):
+        h = self._harness(temp_home)
+        unread = {"2": None, "3": None}
+        assert h.tick_with_entries(self._entries(h, _usage(62), unread)) is (
+            TickOutcome.NO_ACTION
+        )
+        h.clock.advance(195.0)
+        assert h.tick_with_entries(self._entries(h, _usage(85), unread)) is (
+            TickOutcome.NO_ACTION
+        )
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons[-1] == "early-switch-no-target"
+        assert h.active_number() == 1
+
     def _rank_args(self, h: EngineHarness, active_pct: float, peer_pct: float) -> dict:
         d = lambda n: _iso_at(h.clock.now + n * 86400.0)
         usage = {

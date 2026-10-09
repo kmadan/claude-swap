@@ -611,8 +611,9 @@ def _projected_crossing(
 
     Returns ``(label, pct_now, projected, points_per_minute, limit)`` for the
     first window that would reach its limit, or None when a reading is missing,
-    the two are too far apart, the window is flat or falling, or already past
-    its limit (the ordinary trigger handles that).
+    the two are too far apart, or no window would reach its limit. A window is
+    skipped when it is flat or falling, or already past its limit, which the
+    ordinary trigger handles.
     """
     if not prev or not latest:
         return None
@@ -1482,6 +1483,10 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
         if not oauth_candidates and not api_key_candidates:
+            if early is not None:
+                return self._hold_early(
+                    "burning toward its limit, but there is no other account"
+                )
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -1701,6 +1706,14 @@ class AutoSwitchEngine:
             ordered = api_key_candidates
 
         if not ordered:
+            if early is not None:
+                return self._hold_early(
+                    "burning toward its limit, but no account under its limit "
+                    "to move to"
+                    if any_known
+                    else "burning toward its limit, but no other account's "
+                    "usage is readable this tick"
+                )
             if not any_known:
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
@@ -1769,21 +1782,6 @@ class AutoSwitchEngine:
                     NoSwitchEvent(
                         reason="already-consuming-soonest",
                         detail="no sooner-resetting account with room to spare",
-                    )
-                )
-                return TickOutcome.NO_ACTION
-            if early is not None:
-                # Nothing under its limit to move to. The active account is
-                # still under its own, so staying is safe for now, and neither
-                # "blocked" nor "all exhausted" would be true; if it crosses,
-                # the ordinary trigger takes over on that reading.
-                self._emit(
-                    NoSwitchEvent(
-                        reason="early-switch-no-target",
-                        detail=(
-                            "burning toward its limit, but no account under "
-                            "its limit to move to"
-                        ),
                     )
                 )
                 return TickOutcome.NO_ACTION
@@ -3112,6 +3110,16 @@ class AutoSwitchEngine:
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
+
+    def _hold_early(self, detail: str) -> TickOutcome:
+        """Stay on an account whose early switch found nowhere to go.
+
+        The account is still under its limit, so staying is safe for now and
+        neither "blocked" nor "all exhausted" would be true. If it crosses, the
+        ordinary trigger takes over on that reading.
+        """
+        self._emit(NoSwitchEvent(reason="early-switch-no-target", detail=detail))
+        return TickOutcome.NO_ACTION
 
     def _note_reading(self, num: str, entry) -> None:
         """Keep the last two distinct readings of the active account.
