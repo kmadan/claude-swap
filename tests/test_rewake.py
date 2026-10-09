@@ -344,7 +344,7 @@ class TestHookEntry:
         with patch.object(rewake, "run_rewake", side_effect=RuntimeError("boom")):
             assert hook_main(payload) == (0, "")
 
-    def test_the_command_prints_only_the_reminder_and_exits_2(self, capsys):
+    def test_the_command_prints_only_the_reminder_and_exits_with_the_wake_code(self, capsys):
         from claude_swap import cli
 
         with (
