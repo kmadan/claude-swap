@@ -90,6 +90,13 @@ class TestWaitsForUsage:
         assert _run(world, tmp_path, _payload(error="overloaded")) == (0, "")
         assert world.slept == []
 
+    def test_a_subagent_stop_is_left_to_the_main_thread(self, tmp_path):
+        world = World()
+        world.at(1.0, world.set("14", True, -5.0))
+        payload = dict(_payload(), agent_id="a28d78b9775c99ef9", agent_type="general-purpose")
+        assert _run(world, tmp_path, payload) == (0, "")
+        assert world.slept == []
+
     def test_wakes_once_cswap_lands_on_an_account_under_its_limit(self, tmp_path):
         world = World()
         start = world.now

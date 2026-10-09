@@ -246,6 +246,12 @@ def run_rewake(
         return 0, ""
     if payload.get("error") not in set(errors):
         return 0, ""
+    if payload.get("agent_id"):
+        # A subagent's stop. The main thread receives the failure as the
+        # subagent's result, and when its own next request is refused it stops
+        # with a StopFailure of its own, which is the one to wake. Waking the
+        # session for the subagent could start a turn nobody asked for.
+        return 0, ""
     session = payload.get("session_id")
     if not isinstance(session, str) or not session:
         return 0, ""
