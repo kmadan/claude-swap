@@ -120,6 +120,17 @@ class AutoSwitchSettings:
     # while five-minute visits started four out of four. Too short wastes the
     # switch; too long spends the window it just opened.
     prime_hold_seconds: float = 90.0
+    # Prime only while something is working. A window opens on a request, so a
+    # visit made while nothing is sending requests starts nothing and costs two
+    # switches. Measured over a week: visits made when no account's 5-hour
+    # usage had risen in the previous 10 minutes opened a window 14% of the
+    # time (32 of 229); visits made after a rise of at least 0.5 points a
+    # minute opened one 97% of the time (118 of 122). The rate is in points of
+    # a 1x seat per minute, over two readings of the same window; 0 primes
+    # regardless.
+    prime_min_burn: float = 0.5
+    # How recent that rise must be, in minutes.
+    prime_activity_minutes: float = 10.0
     # Spend a 5-hour window that is about to reset before the capacity in it
     # is lost. A window's unused quota is gone at its reset, while the active
     # account's own window keeps whatever is not spent until its later reset,
@@ -248,6 +259,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "primeHoldSeconds", "prime_hold_seconds", "float", 0.0, 600.0,
             help="Seconds to stay on a primed account so the client can pick it up",
+        ),
+        SettingSpec(
+            "autoswitch", "primeMinBurn", "prime_min_burn", "float", 0.0, 100.0,
+            help="Prime only after 5h usage rose this fast (points/min); 0 primes regardless",
+        ),
+        SettingSpec(
+            "autoswitch", "primeActivityMinutes", "prime_activity_minutes", "float", 1.0, 120.0,
+            help="How recent that rise in 5h usage must be, in minutes",
         ),
         SettingSpec(
             "autoswitch", "spendExpiringWindows", "spend_expiring_windows", "bool",

@@ -986,6 +986,11 @@ class AutoSwitchEngine:
         # projection was last logged.
         self._readings: dict[str, list[tuple[float, dict]]] = {}
         self._early_logged_for: dict[str, float] = {}
+        # Each account's last 5h reading, (fetched_at, pct, resets_at epoch),
+        # and when one last rose fast enough to show work in progress. Priming
+        # waits for that evidence; see _note_activity.
+        self._last_five_hour: dict[str, tuple[float, float, float | None]] = {}
+        self._activity_at: float | None = None
         # A TUI session override outranks the file, and must survive a reload.
         self._session_threshold: float | None = None
         # Poll plans written by the collector must key on the same threshold/
@@ -1318,6 +1323,7 @@ class AutoSwitchEngine:
             current, quarantined, threshold=settings.threshold
         )
         self._note_reading(current, entries.get(current))
+        self._note_activity(entries, settings)
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -2825,6 +2831,7 @@ class AutoSwitchEngine:
                             settings.prime_idle_clocks
                             and num not in primed_recently
                             and not _clock_started(usage.get(num))
+                            and self._primes_allowed(now, settings)
                         ):
                             # Not worth moving to on its own merits, but its
                             # clock is idle and starting one is the point.
@@ -3265,6 +3272,55 @@ class AutoSwitchEngine:
         """
         self._emit(NoSwitchEvent(reason="early-switch-no-target", detail=detail))
         return TickOutcome.NO_ACTION
+
+    def _note_activity(self, entries: dict, settings: AutoSwitchSettings) -> None:
+        """Record when any account's 5h usage last rose fast enough to show work.
+
+        Readings of every account count, the active one and the ones still in
+        use by sessions that have not picked up a switch, because the question
+        is whether requests are being sent at all. Two readings at most 15
+        minutes apart give a rate in points of a 1x seat per minute; a window
+        that opened between them counts at the rate its first reading implies.
+        """
+        for num, entry in entries.items():
+            if (
+                entry is None
+                or entry.fetched_at is None
+                or not isinstance(entry.last_good, dict)
+            ):
+                continue
+            five = entry.last_good.get("five_hour")
+            if not (isinstance(five, dict) and isinstance(five.get("pct"), (int, float))):
+                continue
+            pct = float(five["pct"])
+            reset = _parse_reset_ts(five.get("resets_at"))
+            prev = self._last_five_hour.get(num)
+            if prev is not None and entry.fetched_at <= prev[0]:
+                continue
+            self._last_five_hour[num] = (entry.fetched_at, pct, reset)
+            if prev is None:
+                continue
+            span_min = (entry.fetched_at - prev[0]) / 60.0
+            if span_min <= 0 or span_min > 15.0 or reset is None:
+                continue
+            if prev[2] is not None and abs(prev[2] - reset) < 120.0:
+                rise = pct - prev[1]          # the same window, climbing
+            elif prev[2] is None or prev[2] <= prev[0]:
+                rise = pct                    # a window that opened since
+            else:
+                continue                      # a new window replaced a running one
+            rate = rise * self._weights.get(num, 1.0) / span_min
+            if rise > 0 and rate >= settings.prime_min_burn:
+                self._activity_at = max(self._activity_at or 0.0, entry.fetched_at)
+
+    def _primes_allowed(self, now: float, settings: AutoSwitchSettings) -> bool:
+        """Whether a visit to start an idle clock would likely catch a request."""
+        if settings.prime_min_burn <= 0:
+            return True
+        return (
+            self._activity_at is not None
+            and now - self._activity_at <= settings.prime_activity_minutes * 60.0
+        )
 
     def _note_reading(self, num: str, entry) -> None:
         """Keep the last two distinct readings of the active account.

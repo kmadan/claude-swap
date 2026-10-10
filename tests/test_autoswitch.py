@@ -7788,6 +7788,8 @@ class TestProactivePriming:
     """
 
     def _harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        # Priming mechanics, not the activity gate (TestPrimingWaitsForWork).
+        kwargs.setdefault("prime_min_burn", 0.0)
         h = EngineHarness(
             temp_home, strategy="runway", prime_idle_clocks=True, **kwargs
         )
@@ -7895,7 +7897,9 @@ class TestPrimingRunsAsAPass:
     """
 
     def _harness(self, temp_home: Path) -> EngineHarness:
-        h = EngineHarness(temp_home, strategy="runway", prime_idle_clocks=True)
+        h = EngineHarness(
+            temp_home, strategy="runway", prime_idle_clocks=True, prime_min_burn=0.0
+        )
         for num, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
             h.seed(num, email)
         h.make_live("a@example.com", 1)
@@ -8037,6 +8041,7 @@ class TestPrimeRetryBacksOff:
             strategy="runway",
             prime_idle_clocks=True,
             cooldown_seconds=0.0,
+            prime_min_burn=0.0,  # the backoff, not the activity gate
         )
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
@@ -8694,3 +8699,101 @@ class TestExpiringWindow:
         assert _expiring_window(
             self._usage(86, 40, 10), 1_000_000.0, 1.0, AutoSwitchSettings()
         ) is not None
+
+
+class TestPrimingWaitsForWork:
+    """Prime an idle clock only while requests are being sent.
+
+    Measured over a week of samples: of 359 visits to an idle clock, those made
+    when no account's 5h usage had risen in the previous 10 minutes opened a
+    window 32 times in 229, and those made after a rise of at least 0.5 points
+    a minute opened one 118 times in 122. In the early hours of 2026-10-10 the
+    engine made 72 switches between 01:51 and 07:04, 52 of them onto an idle
+    clock while almost nothing was running, and 3 of those opened a window.
+    """
+
+    def _harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="runway", prime_idle_clocks=True, **kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self.t0 = h.clock.now
+        return h
+
+    def _fleet(self, active_pct: float, **override) -> dict:
+        at = lambda hours: _iso_at(self.t0 + hours * 3600.0)
+        fleet = {
+            # Working, with plenty of weekly left: nothing else is due.
+            "1": {"five_hour": {"pct": active_pct, "resets_at": at(3)},
+                  "seven_day": {"pct": 40.0, "resets_at": at(72)}},
+            # Idle clock, too little weekly runway for an ordinary move.
+            "2": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 60.0, "resets_at": at(120)}},
+            # Running window, little runway: never a target here.
+            "3": {"five_hour": {"pct": 10.0, "resets_at": at(4)},
+                  "seven_day": {"pct": 80.0, "resets_at": at(96)}},
+        }
+        fleet.update(override)
+        return fleet
+
+    def _reasons(self, h: EngineHarness) -> list[str]:
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def test_with_nothing_rising_it_does_not_prime(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self._fleet(30)) is TickOutcome.NO_ACTION
+        h.clock.advance(120)
+        assert h.tick_with_usage(self._fleet(30)) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert self._reasons(h)[-1] == "already-best-runway"
+
+    def test_a_rise_lets_it_prime(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self._fleet(30)) is TickOutcome.NO_ACTION
+        h.clock.advance(120)
+        assert h.tick_with_usage(self._fleet(32)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_slow_rise_is_not_enough(self, temp_home):
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(self._fleet(30)) is TickOutcome.NO_ACTION
+        h.clock.advance(600)
+        assert h.tick_with_usage(self._fleet(31)) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_activity_goes_stale(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine._mutate_state(
+            lambda s: s.update({"lastSwitchAt": h.clock.now, "lastSwitchTo": "1"})
+        )
+        assert h.tick_with_usage(self._fleet(30)) is TickOutcome.NO_ACTION
+        h.clock.advance(120)
+        # The rise is seen inside the cooldown, so nothing moves yet.
+        assert h.tick_with_usage(self._fleet(32)) is TickOutcome.NO_ACTION
+        assert "cooldown" in self._reasons(h)
+        h.clock.advance(660)  # cooldown over, the rise now 11 minutes old
+        assert h.tick_with_usage(self._fleet(32)) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_a_premium_seat_rises_at_its_size(self, temp_home):
+        h = self._harness(temp_home, account_weights="1:5")
+        assert h.tick_with_usage(self._fleet(30)) is TickOutcome.NO_ACTION
+        h.clock.advance(360)
+        # One point in six minutes is 0.17 a minute raw, 0.83 on a 5x seat.
+        assert h.tick_with_usage(self._fleet(31)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_window_that_opened_counts_as_work(self, temp_home):
+        h = self._harness(temp_home)
+        quiet = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 80.0, "resets_at": _iso_at(self.t0 + 96 * 3600)}}
+        assert h.tick_with_usage(self._fleet(30, **{"3": quiet})) is TickOutcome.NO_ACTION
+        h.clock.advance(120)
+        opened = {"five_hour": {"pct": 3.0, "resets_at": _iso_at(self.t0 + 5 * 3600)},
+                  "seven_day": {"pct": 80.0, "resets_at": _iso_at(self.t0 + 96 * 3600)}}
+        assert h.tick_with_usage(self._fleet(30, **{"3": opened})) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_zero_primes_regardless(self, temp_home):
+        h = self._harness(temp_home, prime_min_burn=0.0)
+        assert h.tick_with_usage(self._fleet(30)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
