@@ -3305,10 +3305,12 @@ class AutoSwitchEngine:
                 continue
             if prev[2] is not None and abs(prev[2] - reset) < 120.0:
                 rise = pct - prev[1]          # the same window, climbing
-            elif prev[2] is None or prev[2] <= prev[0]:
-                rise = pct                    # a window that opened since
+            elif prev[2] is None or prev[2] <= entry.fetched_at:
+                # No window then, or that one has reset since: the window now
+                # running opened between the readings, which takes a request.
+                rise = pct
             else:
-                continue                      # a new window replaced a running one
+                continue                      # resets disagree while both run
             rate = rise * self._weights.get(num, 1.0) / span_min
             if rise > 0 and rate >= settings.prime_min_burn:
                 self._activity_at = max(self._activity_at or 0.0, entry.fetched_at)

@@ -8793,6 +8793,18 @@ class TestPrimingWaitsForWork:
         assert h.tick_with_usage(self._fleet(30, **{"3": opened})) is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_a_window_that_reset_and_reopened_counts_as_work(self, temp_home):
+        """The running window expired between readings and a new one opened."""
+        h = self._harness(temp_home)
+        week = {"pct": 80.0, "resets_at": _iso_at(self.t0 + 96 * 3600)}
+        ending = {"five_hour": {"pct": 40.0, "resets_at": _iso_at(self.t0 + 60)}, "seven_day": week}
+        assert h.tick_with_usage(self._fleet(30, **{"3": ending})) is TickOutcome.NO_ACTION
+        h.clock.advance(120)
+        reopened = {"five_hour": {"pct": 3.0, "resets_at": _iso_at(self.t0 + 60 + 5 * 3600)},
+                    "seven_day": week}
+        assert h.tick_with_usage(self._fleet(30, **{"3": reopened})) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
     def test_zero_primes_regardless(self, temp_home):
         h = self._harness(temp_home, prime_min_burn=0.0)
         assert h.tick_with_usage(self._fleet(30)) is TickOutcome.SWITCHED
