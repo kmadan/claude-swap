@@ -131,6 +131,14 @@ class AutoSwitchSettings:
     prime_min_burn: float = 0.5
     # How recent that rise must be, in minutes.
     prime_activity_minutes: float = 10.0
+    # The least work, in minutes at the pace the active account is being worked
+    # (floored at ``burn_rate``), an account must be able to take to be moved
+    # to. Measured on 2026-10-10, an optional runway move landed on a 5x seat at
+    # 94% of its 98% limit: under its limit, so eligible, but holding about a
+    # minute of work at the pace of the moment. An optional move skips an
+    # account short of this; a forced one ranks such accounts last, by the
+    # most work they can take. 0 turns it off.
+    landing_min_minutes: float = 10.0
     # Spend a 5-hour window that is about to reset before the capacity in it
     # is lost. A window's unused quota is gone at its reset, while the active
     # account's own window keeps whatever is not spent until its later reset,
@@ -259,6 +267,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "primeHoldSeconds", "prime_hold_seconds", "float", 0.0, 600.0,
             help="Seconds to stay on a primed account so the client can pick it up",
+        ),
+        SettingSpec(
+            "autoswitch", "landingMinMinutes", "landing_min_minutes", "float", 0.0, 120.0,
+            help="Only move to an account that can take this many minutes at the current pace",
         ),
         SettingSpec(
             "autoswitch", "primeMinBurn", "prime_min_burn", "float", 0.0, 100.0,

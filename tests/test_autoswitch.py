@@ -31,6 +31,7 @@ from claude_swap.autoswitch import (
     UnquarantineEvent,
     _expiring_window,
     _projected_crossing,
+    _room_points,
     _recovery_is_useful,
     _weekly_runway,
     pct_label,
@@ -8809,3 +8810,123 @@ class TestPrimingWaitsForWork:
         h = self._harness(temp_home, prime_min_burn=0.0)
         assert h.tick_with_usage(self._fleet(30)) is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+
+class TestLandingRoom:
+    """Move only to an account that can take some minutes of the current pace.
+
+    Measured 2026-10-10: at 09:44:27 an optional runway move took the fleet
+    from #16 (26% of its 5h window, climbing about 5 points a minute) back to
+    #19, a 5x seat at 94% of its 98% limit. #19 was under its limit, so the
+    landing check passed, and its weekly runway beat #16's by the margin, but
+    it held 4 points (20 on a 1x scale), about four minutes at that pace; the
+    early switch had to take the fleet off it again at 09:48:08.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _limits(self, monkeypatch):
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: _LIVE_LIMITS)
+
+    def _harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        kwargs.setdefault("prime_idle_clocks", False)
+        h = EngineHarness(
+            temp_home, strategy="runway", runway_margin=1.25, interval_seconds=15.0,
+            account_weights="19:5", **kwargs,
+        )
+        for num in (16, 19, 8, 18):
+            h.seed(num, f"u{num}@example.com")
+        h.make_live("u16@example.com", 16)
+        self.t0 = h.clock.now
+        # Just inside the cooldown, so the first tick only records a reading.
+        h.engine._mutate_state(
+            lambda s: s.update({"lastSwitchAt": self.t0 - 40.0, "lastSwitchTo": "16"})
+        )
+        return h
+
+    def _at(self, hours: float) -> str:
+        return _iso_at(self.t0 + hours * 3600.0)
+
+    def _fleet(self, pct16: float, **override) -> dict:
+        fleet = {
+            "16": {"five_hour": {"pct": pct16, "resets_at": self._at(4.2)},
+                   "seven_day": {"pct": 29.0, "resets_at": self._at(38)}},
+            "19": {"five_hour": {"pct": 94.0, "resets_at": self._at(2.1)},
+                   "seven_day": {"pct": 50.0, "resets_at": self._at(70)}},
+            "8": {"five_hour": {"pct": 5.0, "resets_at": self._at(4.2)},
+                  "seven_day": {"pct": 56.0, "resets_at": self._at(127)}},
+            "18": {"five_hour": {"pct": 14.0, "resets_at": self._at(1.9)},
+                   "seven_day": {"pct": 84.0, "resets_at": self._at(105)}},
+        }
+        fleet.update(override)
+        return fleet
+
+    def _two_ticks(self, h, first, second, seconds=266.0, **override):
+        assert h.tick_with_usage(self._fleet(first, **override)) is TickOutcome.NO_ACTION
+        h.clock.advance(seconds)
+        return h.tick_with_usage(self._fleet(second, **override))
+
+    def test_no_optional_move_to_an_account_that_cannot_take_the_pace(self, temp_home):
+        h = self._harness(temp_home)
+        # 4% -> 26% in 4.4 minutes: about 5 points a minute, so 10 minutes is
+        # 50 points, and #19 holds 20.
+        assert self._two_ticks(h, 4.0, 26.0) is TickOutcome.NO_ACTION
+        assert h.active_number() == 16
+
+    def test_at_a_normal_pace_the_same_account_is_still_usable(self, temp_home):
+        h = self._harness(temp_home)
+        # 20% -> 21%: the floor of burnRate applies, 8 points, and #19 holds 20.
+        assert self._two_ticks(h, 20.0, 21.0) is TickOutcome.SWITCHED
+        assert h.active_number() == 19
+
+    def test_a_forced_move_lands_where_the_pace_fits(self, temp_home):
+        h = self._harness(temp_home)
+        # 70% -> 93%, past its 92% limit, at about 5 points a minute.
+        assert self._two_ticks(h, 70.0, 93.0) is TickOutcome.SWITCHED
+        assert h.active_number() == 8
+
+    def test_an_escape_from_an_exhausted_account_does_too(self, temp_home):
+        h = self._harness(temp_home)
+        assert self._two_ticks(h, 75.0, 100.0) is TickOutcome.SWITCHED
+        assert h.active_number() == 8
+
+    def test_when_nothing_can_take_it_the_most_room_wins(self, temp_home):
+        h = self._harness(temp_home)
+        roomy = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 70.0, "resets_at": self._at(105)}}
+        # 40% -> 93% in two minutes: 26 points a minute needs 260 points.
+        assert self._two_ticks(h, 40.0, 93.0, seconds=120.0, **{"18": roomy}) is (
+            TickOutcome.SWITCHED
+        )
+        assert h.active_number() == 18
+
+    def test_zero_turns_it_off(self, temp_home):
+        h = self._harness(temp_home, landing_min_minutes=0.0)
+        assert self._two_ticks(h, 4.0, 26.0) is TickOutcome.SWITCHED
+        assert h.active_number() == 19
+
+
+class TestRoomPoints:
+    @pytest.fixture(autouse=True)
+    def _limits(self, monkeypatch):
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: _LIVE_LIMITS)
+        monkeypatch.setattr(oauth, "decision_windows", lambda: frozenset({"5h", "7d"}))
+
+    @staticmethod
+    def _usage(pct5, pct7, reset5=None, now=1_000_000.0):
+        five: dict = {"pct": pct5}
+        if reset5 is not None:
+            five["resets_at"] = _iso_at(now + reset5)
+        return {"five_hour": five, "seven_day": {"pct": pct7}}
+
+    def test_a_nearly_full_premium_window(self):
+        assert _room_points(self._usage(94, 50, 3600), 1_000_000.0, 5.0, AutoSwitchSettings()) == 20.0
+
+    def test_a_fresh_premium_window_takes_a_burst(self):
+        assert _room_points(self._usage(0, 10), 1_000_000.0, 5.0, AutoSwitchSettings()) == 98 * 5
+
+    def test_the_weekly_window_can_be_the_smaller(self):
+        room = _room_points(self._usage(0, 96), 1_000_000.0, 1.0, AutoSwitchSettings())
+        assert room == pytest.approx((97 - 96) * 8.5)
+
+    def test_a_window_that_reset_since_the_reading_is_empty(self):
+        room = _room_points(self._usage(94, 10, reset5=-60), 1_000_000.0, 1.0, AutoSwitchSettings())
+        assert room == 92.0

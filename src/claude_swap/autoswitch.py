@@ -862,6 +862,42 @@ def _expiring_window(
     return _Expiring(reset_ts, minutes, points, float(pct7))
 
 
+def _room_points(
+    usage: dict | str | None, now: float, weight: float, settings: AutoSwitchSettings
+) -> float | None:
+    """The work an account can still take, in 5-hour points of a 1x seat.
+
+    The smaller of its 5-hour room and its weekly room, each measured to the
+    window's own limit scaled for the seat, the weekly one converted at
+    ``window_ratio`` 5-hour points per weekly point; the weekly window counts
+    only when the decision reads it. A window whose reset has passed since the
+    reading is counted as empty, since it has. None when nothing is readable.
+    """
+    if not isinstance(usage, dict):
+        return None
+    limits, _file_threshold = oauth.window_thresholds()
+    selected = oauth.decision_windows()
+    rooms = []
+    for key, label, ratio in (
+        ("five_hour", "5h", 1.0),
+        ("seven_day", "7d", settings.window_ratio),
+    ):
+        if label not in selected:
+            continue
+        window = usage.get(key)
+        if not (isinstance(window, dict) and isinstance(window.get("pct"), (int, float))):
+            continue
+        pct = float(window["pct"])
+        reset = _parse_reset_ts(window.get("resets_at"))
+        if reset is not None and reset <= now:
+            pct = 0.0
+        limit = (
+            oauth.scaled_limit(limits[label], weight) if label in limits else settings.threshold
+        )
+        rooms.append(max(0.0, limit - pct) * weight * ratio)
+    return min(rooms) if rooms else None
+
+
 def _reserve_units(
     usage: dict | str | None,
     models: Sequence[str],
@@ -2621,6 +2657,11 @@ class AutoSwitchEngine:
         # included, because that quota is lost at the reset while every other
         # move can wait. Soonest reset first.
         expiring: list[tuple[tuple, str]] = []
+        # The least room a target must have: landing_min_minutes at the pace the
+        # active account is being worked, floored at burnRate (see
+        # _measured_pace and _room_points).
+        pace = max(self._measured_pace(current) or 0.0, settings.burn_rate)
+        min_room = settings.landing_min_minutes * pace
         active_expiry_ts = (
             _five_hour_reset_ts(usage.get(current), now) or float("inf")
             if by_runway and trigger == "runway" and settings.spend_expiring_windows
@@ -2633,6 +2674,14 @@ class AutoSwitchEngine:
             any_known = True          # it EXISTS and is readable either way
             if h <= 0:
                 continue  # itself at its limit — never a target
+            room = _room_points(usage.get(num), now, self._weights.get(num, 1.0), settings)
+            # landingMinMinutes 0 makes min_room 0, which nothing falls short of.
+            short = room is not None and room < min_room
+            if short and trigger in ("runway", "consume-first"):
+                # Under its limit but unable to take landing_min_minutes of the
+                # current pace: moving there by choice would only bring the next
+                # forced move closer.
+                continue
             if num == no_return:
                 # See _no_return_account. Kept as a last resort rather than
                 # dropped, but only while the active account is over its limit
@@ -2912,6 +2961,11 @@ class AutoSwitchEngine:
                 )
             else:
                 key = (-h,)
+            if trigger in ("proactive", "at-limit", "failover") and not all_above:
+                # A forced move lands first on an account that can take
+                # landing_min_minutes of the current pace; one that cannot is
+                # ranked after all of those, by the most work it can take.
+                key = (1, -(room or 0.0)) if short else (0, *key)
             if trigger in ("at-limit", "failover") and not all_above:
                 # An escape takes any account with headroom, but one still
                 # under its limit first: landing past a limit buys only the
@@ -3323,6 +3377,31 @@ class AutoSwitchEngine:
             self._activity_at is not None
             and now - self._activity_at <= settings.prime_activity_minutes * 60.0
         )
+
+    def _measured_pace(self, num: str) -> float | None:
+        """The rate the account's 5h window rose over its last two readings.
+
+        In points of a 1x seat per minute, from readings of the current stint at
+        most 15 minutes apart on the same window. None when that is unknown or
+        the window did not rise.
+        """
+        history = self._readings.get(num) or []
+        if len(history) < 2:
+            return None
+        (t0, u0), (t1, u1) = history[-2], history[-1]
+        span_min = (t1 - t0) / 60.0
+        if span_min <= 0 or span_min > 15.0:
+            return None
+        w0, w1 = u0.get("five_hour"), u1.get("five_hour")
+        if not (isinstance(w0, dict) and isinstance(w1, dict)):
+            return None
+        p0, p1 = w0.get("pct"), w1.get("pct")
+        if not (isinstance(p0, (int, float)) and isinstance(p1, (int, float))) or p1 <= p0:
+            return None
+        r0, r1 = _parse_reset_ts(w0.get("resets_at")), _parse_reset_ts(w1.get("resets_at"))
+        if r0 is None or r1 is None or abs(r0 - r1) >= 120.0:
+            return None
+        return (p1 - p0) * self._weights.get(num, 1.0) / span_min
 
     def _note_reading(self, num: str, entry) -> None:
         """Keep the last two distinct readings of the active account.
