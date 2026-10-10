@@ -120,6 +120,20 @@ class AutoSwitchSettings:
     # while five-minute visits started four out of four. Too short wastes the
     # switch; too long spends the window it just opened.
     prime_hold_seconds: float = 90.0
+    # Spend a 5-hour window that is about to reset before the capacity in it
+    # is lost. A window's unused quota is gone at its reset, while the active
+    # account's own window keeps whatever is not spent until its later reset,
+    # so working on the expiring one first adds capacity rather than moving it.
+    # Read only by the `runway` strategy, below the threshold.
+    spend_expiring_windows: bool = True
+    # How close to its reset a window must be to count as expiring, in minutes.
+    expiry_horizon_minutes: float = 60.0
+    # The least work, in minutes at ``burn_rate``, a move must be able to
+    # spend before the window resets or reaches its limit to be worth a switch.
+    expiry_min_work_minutes: float = 10.0
+    # Spending an expiring window costs that account weekly quota, so only an
+    # account whose weekly window is under this percentage qualifies.
+    expiry_weekly_max: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -234,6 +248,22 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "primeHoldSeconds", "prime_hold_seconds", "float", 0.0, 600.0,
             help="Seconds to stay on a primed account so the client can pick it up",
+        ),
+        SettingSpec(
+            "autoswitch", "spendExpiringWindows", "spend_expiring_windows", "bool",
+            help="Below the threshold, use a 5h window about to reset before its quota is lost",
+        ),
+        SettingSpec(
+            "autoswitch", "expiryHorizonMinutes", "expiry_horizon_minutes", "float", 5.0, 300.0,
+            help="Minutes before its reset a 5h window counts as expiring",
+        ),
+        SettingSpec(
+            "autoswitch", "expiryMinWorkMinutes", "expiry_min_work_minutes", "float", 0.0, 120.0,
+            help="Least work (minutes at burnRate) an expiring window must still hold",
+        ),
+        SettingSpec(
+            "autoswitch", "expiryWeeklyMax", "expiry_weekly_max", "float", 0.0, 100.0,
+            help="Only spend an expiring window on an account whose weekly pct is below this",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

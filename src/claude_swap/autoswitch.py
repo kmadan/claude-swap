@@ -40,7 +40,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
@@ -784,6 +784,84 @@ def _clock_started(usage: dict | str | None) -> bool:
     return not isinstance(window, dict) or bool(window.get("resets_at"))
 
 
+def _five_hour_reset_ts(usage: dict | str | None, now: float) -> float | None:
+    """Epoch at which a running 5-hour window resets, or None if none is running."""
+    if isinstance(usage, dict):
+        window = usage.get("five_hour")
+        if isinstance(window, dict):
+            ts = _parse_reset_ts(window.get("resets_at"))
+            if ts is not None and ts > now:
+                return ts
+    return None
+
+
+class _Expiring(NamedTuple):
+    """A running 5-hour window worth spending before it resets."""
+
+    reset_ts: float
+    minutes: float   # until the window resets
+    points: float    # left before its 5h limit, in 5-hour points of a 1x seat
+    weekly: float    # the account's weekly percentage
+
+
+def _expiring_window(
+    usage: dict | str | None,
+    now: float,
+    weight: float,
+    settings: AutoSwitchSettings,
+    *,
+    active_expiry_ts: float | None = None,
+) -> _Expiring | None:
+    """The account's 5-hour window, when it is worth spending before it resets.
+
+    A window's unused quota is lost at its reset. The active account's window
+    keeps whatever is not spent until its own later reset, so working on an
+    account whose window is about to reset adds capacity rather than moving
+    it. What it does cost is that account's weekly quota, at about
+    ``window_ratio`` 5-hour points per weekly point, so an account qualifies
+    only while its weekly percentage is under ``expiry_weekly_max``.
+
+    A window qualifies when it is running, resets within
+    ``expiry_horizon_minutes``, is under its own 5h limit, and the weekly
+    condition holds. That alone answers whether the active account should stay
+    where it is. With ``active_expiry_ts``, the reset of the active account's
+    own window (``inf`` when none is running), it answers whether a candidate
+    is worth moving to, which also needs ``expiry_min_work_minutes`` of work it
+    can still take at ``burn_rate`` before resetting or reaching its limit, and
+    an active window that resets at least a horizon later: moving between two
+    windows that both reset soon only exchanges one loss for the other.
+    """
+    if not settings.spend_expiring_windows or not isinstance(usage, dict):
+        return None
+    five, seven = usage.get("five_hour"), usage.get("seven_day")
+    if not (isinstance(five, dict) and isinstance(seven, dict)):
+        return None
+    pct5, pct7 = five.get("pct"), seven.get("pct")
+    if not (isinstance(pct5, (int, float)) and isinstance(pct7, (int, float))):
+        return None
+    if pct7 >= settings.expiry_weekly_max:
+        return None
+    reset_ts = _five_hour_reset_ts(usage, now)
+    horizon_s = settings.expiry_horizon_minutes * 60.0
+    if reset_ts is None or reset_ts - now > horizon_s:
+        return None
+    limits, _file_threshold = oauth.window_thresholds()
+    limit = (
+        oauth.scaled_limit(limits["5h"], weight) if "5h" in limits else settings.threshold
+    )
+    points = (limit - float(pct5)) * weight
+    if points <= 0:
+        return None
+    minutes = (reset_ts - now) / 60.0
+    if active_expiry_ts is not None:
+        usable = min(points / settings.burn_rate, minutes)
+        if usable < settings.expiry_min_work_minutes:
+            return None
+        if active_expiry_ts - reset_ts < horizon_s:
+            return None
+    return _Expiring(reset_ts, minutes, points, float(pct7))
+
+
 def _reserve_units(
     usage: dict | str | None,
     models: Sequence[str],
@@ -1355,6 +1433,26 @@ class AutoSwitchEngine:
                     )
                     return TickOutcome.NO_ACTION
 
+            if trigger == "runway":
+                # The active window resets soon with quota left in it. Every
+                # optional move waits until it has been spent or has reset;
+                # reaching the limit still moves, as the proactive trigger.
+                spending = _expiring_window(
+                    usage.get(current), self.clock(),
+                    self._weights.get(current, 1.0), settings,
+                )
+                if spending is not None:
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="spending-expiring-window",
+                            detail=(
+                                f"5h window resets in {spending.minutes:.0f}m "
+                                f"with {spending.points:.0f} points left"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1860,6 +1958,25 @@ class AutoSwitchEngine:
                     )
                     return TickOutcome.NO_ACTION
             note = self._switch_note(num, usage, settings, decided_now, gap_units)
+            # Recomputed from the inputs the ranking read, like the note: was
+            # this a move to spend a window before it resets?
+            spend = (
+                _expiring_window(
+                    usage.get(num), decided_now, self._weights.get(num, 1.0),
+                    settings,
+                    active_expiry_ts=(
+                        _five_hour_reset_ts(usage.get(current), decided_now)
+                        or float("inf")
+                    ),
+                )
+                if trigger == "runway" and by_runway
+                else None
+            )
+            if spend is not None:
+                note = (
+                    f"5h window resets in {spend.minutes:.0f}m with "
+                    f"{spend.points:.0f} points left, weekly {spend.weekly:.0f}%"
+                )
             # A move the ranking would not otherwise have made, to an account
             # whose window has not opened: a prime. Recorded so the next tick
             # holds here until it opens, and so an idle machine cannot be
@@ -1906,6 +2023,12 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
+            if spend is not None:
+                _logger.info(
+                    "Spending account %s's 5h window before it resets in %.0fm: "
+                    "%.0f points left, weekly %.0f%%",
+                    num, spend.minutes, spend.points, spend.weekly,
+                )
             return self._perform(
                 num, email, trigger, left_snapshot, note, primed,
                 cooldown_exempt=limit_exempt,
@@ -2487,6 +2610,16 @@ class AutoSwitchEngine:
         # otherwise schedule no refresh at all. Self-limiting, because the
         # account stops being idle the moment it is used.
         prime: list[tuple[tuple, str]] = []
+        # Candidates whose 5-hour window is about to reset with quota left in
+        # it (see _expiring_window). Spent before anything optional, priming
+        # included, because that quota is lost at the reset while every other
+        # move can wait. Soonest reset first.
+        expiring: list[tuple[tuple, str]] = []
+        active_expiry_ts = (
+            _five_hour_reset_ts(usage.get(current), now) or float("inf")
+            if by_runway and trigger == "runway" and settings.spend_expiring_windows
+            else None
+        )
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
@@ -2666,6 +2799,16 @@ class AutoSwitchEngine:
                     ):
                         continue
                 elif by_runway:
+                    if active_expiry_ts is not None:
+                        spend = _expiring_window(
+                            usage.get(num), now, self._weights.get(num, 1.0),
+                            settings, active_expiry_ts=active_expiry_ts,
+                        )
+                        if spend is not None:
+                            expiring.append(
+                                ((spend.reset_ts, -(cand_runway or 0.0)), num)
+                            )
+                            continue
                     # Above the threshold the active account has to be left, so
                     # any healthy candidate qualifies and the sort picks the
                     # most sustainable. Below it, staying is also correct, so a
@@ -2769,7 +2912,9 @@ class AutoSwitchEngine:
                 key = (0 if (100.0 - h) < settings.threshold else 1, *key)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
-        if prime and trigger == "runway":
+        if expiring and trigger == "runway":
+            qualifying = expiring
+        elif prime and trigger == "runway":
             # Finish priming before optimising. Each idle clock is one switch
             # to start and one to leave; interleaving an ordinary move between
             # every pair doubles that for no gain, since the account with the

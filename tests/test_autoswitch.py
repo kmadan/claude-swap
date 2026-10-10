@@ -29,6 +29,7 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
+    _expiring_window,
     _projected_crossing,
     _recovery_is_useful,
     _weekly_runway,
@@ -8456,3 +8457,240 @@ class TestEscapePrefersAnAccountUnderItsLimit:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() in (2, 3)
+
+
+class TestSpendExpiringWindows:
+    """Spend a 5-hour window about to reset before its quota is lost.
+
+    Built from a fleet observed on 2026-10-10: the active account, a 5x seat,
+    had its 5h window at 45% with 4h09m to run, while two accounts with weekly
+    windows at 16% had 5h windows at 1% and 2% resetting in 29m and 59m. The
+    runway ranking stayed on the 5x seat, so both nearly unused windows were
+    about to reset with their quota unspent.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _limits(self, monkeypatch):
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: _LIVE_LIMITS)
+
+    def _harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        kwargs.setdefault("prime_idle_clocks", False)
+        h = EngineHarness(
+            temp_home,
+            strategy="runway",
+            runway_margin=1.25,
+            interval_seconds=15.0,
+            account_weights="19:5",
+            **kwargs,
+        )
+        for num in (19, 16, 17, 8, 18, 14):
+            h.seed(num, f"u{num}@example.com")
+        h.make_live("u19@example.com", 19)
+        self.t0 = h.clock.now
+        return h
+
+    def _window(self, pct: float, reset_min: float | None) -> dict:
+        window: dict = {"pct": pct}
+        if reset_min is not None:
+            window["resets_at"] = _iso_at(self.t0 + reset_min * 60.0)
+        return window
+
+    def _week(self, pct: float, days: float) -> dict:
+        return {"pct": pct, "resets_at": _iso_at(self.t0 + days * 86400.0)}
+
+    def _fleet(self, **override) -> dict:
+        fleet = {
+            "19": {"five_hour": self._window(45, 249), "seven_day": self._week(42, 3 + 1 / 24)},
+            "16": {"five_hour": self._window(2, 59), "seven_day": self._week(16, 1 + 16 / 24)},
+            "17": {"five_hour": self._window(1, 29), "seven_day": self._week(16, 6 + 8 / 24)},
+            "8": {"five_hour": self._window(0, None), "seven_day": self._week(55, 5 + 9 / 24)},
+            "18": {"five_hour": self._window(14, 219), "seven_day": self._week(84, 4 + 11 / 24)},
+            "14": {"five_hour": self._window(6, 269), "seven_day": self._week(86, 4 + 1 / 24)},
+        }
+        fleet.update(override)
+        return fleet
+
+    def _reasons(self, h: EngineHarness) -> list[str]:
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def test_the_observed_fleet_spends_both_expiring_windows_then_returns(
+        self, temp_home, caplog
+    ):
+        h = self._harness(temp_home)
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            assert h.tick_with_usage(self._fleet()) is TickOutcome.SWITCHED
+        assert h.active_number() == 17
+        switch = [e for e in h.events if isinstance(e, SwitchEvent)][-1]
+        assert switch.trigger == "runway"
+        assert "5h window resets in 29m with 91 points left" in switch.note
+        assert any(
+            "Spending account 17's 5h window" in r.getMessage() for r in caplog.records
+        )
+
+        # While its window runs out, the ordinary runway move back waits.
+        h.clock.advance(16 * 60)
+        used = {"five_hour": self._window(30, 29), "seven_day": self._week(19, 6 + 8 / 24)}
+        assert h.tick_with_usage(self._fleet(**{"17": used})) is TickOutcome.NO_ACTION
+        assert h.active_number() == 17
+        assert self._reasons(h)[-1] == "spending-expiring-window"
+
+        # Account 17 resets and opens a new window; 16 now has 29m to run.
+        h.clock.advance(14 * 60)
+        fresh = {"five_hour": self._window(3, 330), "seven_day": self._week(20, 6 + 8 / 24)}
+        assert h.tick_with_usage(self._fleet(**{"17": fresh})) is TickOutcome.SWITCHED
+        assert h.active_number() == 16
+
+        h.clock.advance(15 * 60)
+        used16 = {"five_hour": self._window(25, 59), "seven_day": self._week(24, 1 + 16 / 24)}
+        assert (
+            h.tick_with_usage(self._fleet(**{"17": fresh, "16": used16}))
+            is TickOutcome.NO_ACTION
+        )
+        assert self._reasons(h)[-1] == "spending-expiring-window"
+
+        # Account 16 resets too: nothing is expiring, so runway takes it home.
+        h.clock.advance(16 * 60)
+        fresh16 = {"five_hour": self._window(3, 361), "seven_day": self._week(27, 1 + 16 / 24)}
+        assert (
+            h.tick_with_usage(self._fleet(**{"17": fresh, "16": fresh16}))
+            is TickOutcome.SWITCHED
+        )
+        assert h.active_number() == 19
+
+    def test_weekly_at_the_cap_is_left_alone(self, temp_home):
+        h = self._harness(temp_home)
+        capped = {
+            "17": {"five_hour": self._window(1, 29), "seven_day": self._week(60, 6.3)},
+            "16": {"five_hour": self._window(2, 59), "seven_day": self._week(60, 1.7)},
+        }
+        assert h.tick_with_usage(self._fleet(**capped)) is TickOutcome.NO_ACTION
+        assert h.active_number() == 19
+
+    def test_weekly_just_under_the_cap_qualifies(self, temp_home):
+        h = self._harness(temp_home)
+        under = {
+            "17": {"five_hour": self._window(1, 29), "seven_day": self._week(59, 6.3)},
+            "16": {"five_hour": self._window(2, 59), "seven_day": self._week(60, 1.7)},
+        }
+        assert h.tick_with_usage(self._fleet(**under)) is TickOutcome.SWITCHED
+        assert h.active_number() == 17
+
+    def test_a_window_more_than_an_hour_from_reset_is_not_expiring(self, temp_home):
+        h = self._harness(temp_home)
+        later = {
+            "17": {"five_hour": self._window(1, 61), "seven_day": self._week(16, 6.3)},
+            "16": {"five_hour": self._window(2, 75), "seven_day": self._week(16, 1.7)},
+        }
+        assert h.tick_with_usage(self._fleet(**later)) is TickOutcome.NO_ACTION
+        assert h.active_number() == 19
+
+    def test_not_when_the_active_window_resets_soon_after(self, temp_home):
+        """Leaving one soon-to-reset window for another only trades the loss."""
+        h = self._harness(temp_home)
+        active = {"five_hour": self._window(45, 80), "seven_day": self._week(42, 3.04)}
+        assert h.tick_with_usage(self._fleet(**{"19": active})) is TickOutcome.NO_ACTION
+        assert h.active_number() == 19
+
+    def test_too_little_time_left_is_not_worth_a_switch(self, temp_home):
+        h = self._harness(temp_home)
+        short = {
+            "17": {"five_hour": self._window(1, 8), "seven_day": self._week(16, 6.3)},
+            "16": {"five_hour": self._window(2, 75), "seven_day": self._week(16, 1.7)},
+        }
+        assert h.tick_with_usage(self._fleet(**short)) is TickOutcome.NO_ACTION
+        assert h.active_number() == 19
+
+    def test_the_cooldown_still_applies(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine._mutate_state(
+            lambda s: s.update({"lastSwitchAt": h.clock.now - 60.0, "lastSwitchTo": "19"})
+        )
+        assert h.tick_with_usage(self._fleet()) is TickOutcome.NO_ACTION
+        assert h.active_number() == 19
+        assert "cooldown" in self._reasons(h)
+
+    def test_it_can_be_turned_off(self, temp_home):
+        h = self._harness(temp_home, spend_expiring_windows=False)
+        assert h.tick_with_usage(self._fleet()) is TickOutcome.NO_ACTION
+        assert h.active_number() == 19
+
+    def test_turned_off_it_does_not_hold_an_expiring_active_window(self, temp_home):
+        h = self._harness(temp_home, spend_expiring_windows=False)
+        h.make_live("u17@example.com", 17)
+        running_out = {"five_hour": self._window(20, 10), "seven_day": self._week(16, 6.3)}
+        assert h.tick_with_usage(self._fleet(**{"17": running_out})) is TickOutcome.SWITCHED
+        assert h.active_number() == 19
+
+    def test_an_expiring_window_comes_before_priming(self, temp_home):
+        h = self._harness(temp_home, prime_idle_clocks=True)
+        assert h.tick_with_usage(self._fleet()) is TickOutcome.SWITCHED
+        assert h.active_number() == 17
+
+    def test_reaching_the_limit_still_moves(self, temp_home):
+        h = self._harness(temp_home)
+        h.make_live("u17@example.com", 17)
+        over = {"five_hour": self._window(93, 20), "seven_day": self._week(30, 6.3)}
+        assert h.tick_with_usage(self._fleet(**{"17": over})) is TickOutcome.SWITCHED
+        assert h.active_number() != 17
+
+    def test_an_active_account_over_the_weekly_cap_does_not_hold(self, temp_home):
+        h = self._harness(temp_home)
+        h.make_live("u17@example.com", 17)
+        heavy = {"five_hour": self._window(20, 10), "seven_day": self._week(65, 6.3)}
+        assert h.tick_with_usage(self._fleet(**{"17": heavy})) is TickOutcome.SWITCHED
+        assert h.active_number() == 19
+
+
+class TestExpiringWindow:
+    """The qualification rule on its own."""
+
+    @pytest.fixture(autouse=True)
+    def _limits(self, monkeypatch):
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: _LIVE_LIMITS)
+
+    @staticmethod
+    def _usage(pct5, reset_min, pct7, now=1_000_000.0):
+        five: dict = {"pct": pct5}
+        if reset_min is not None:
+            five["resets_at"] = _iso_at(now + reset_min * 60.0)
+        return {"five_hour": five, "seven_day": {"pct": pct7}}
+
+    def test_the_observed_account(self):
+        spend = _expiring_window(
+            self._usage(1, 29, 16), 1_000_000.0, 1.0, AutoSwitchSettings(),
+            active_expiry_ts=float("inf"),
+        )
+        assert spend is not None
+        assert spend.minutes == pytest.approx(29.0)
+        assert (spend.points, spend.weekly) == (91.0, 16.0)
+
+    def test_a_premium_seat_counts_its_points_at_their_size(self):
+        spend = _expiring_window(
+            self._usage(45, 20, 42), 1_000_000.0, 5.0, AutoSwitchSettings()
+        )
+        assert spend is not None and spend.points == (98 - 45) * 5
+
+    def test_an_idle_clock_is_not_expiring(self):
+        assert _expiring_window(
+            self._usage(0, None, 10), 1_000_000.0, 1.0, AutoSwitchSettings()
+        ) is None
+
+    def test_an_unknown_weekly_window_does_not_qualify(self):
+        usage = {"five_hour": {"pct": 1, "resets_at": _iso_at(1_000_000.0 + 600)}}
+        assert _expiring_window(usage, 1_000_000.0, 1.0, AutoSwitchSettings()) is None
+
+    def test_a_window_at_its_limit_has_nothing_to_spend(self):
+        assert _expiring_window(
+            self._usage(92, 20, 10), 1_000_000.0, 1.0, AutoSwitchSettings()
+        ) is None
+
+    def test_little_quota_left_is_not_worth_a_move(self):
+        # 6 points at 0.8 a minute is 7.5 minutes of work, under the 10 asked.
+        assert _expiring_window(
+            self._usage(86, 40, 10), 1_000_000.0, 1.0, AutoSwitchSettings(),
+            active_expiry_ts=float("inf"),
+        ) is None
+        # Staying put asks nothing about the amount left.
+        assert _expiring_window(
+            self._usage(86, 40, 10), 1_000_000.0, 1.0, AutoSwitchSettings()
+        ) is not None
