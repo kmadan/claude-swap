@@ -77,9 +77,13 @@ class AutoSwitchSettings:
     # holding five times what the others hold. Percentages are reported
     # against each account's own limit, so without this a point of a large
     # seat and a point of a small one compare as equal, which they are not.
-    # Read only by the `runway` strategy, which is the only place capacity is
-    # compared ACROSS accounts; every threshold decision stays per account and
-    # is unaffected. Unlisted slots weigh 1.
+    # A weight also scales that slot's switch limits (oauth.scaled_limit), so
+    # the reserve above a limit stays the same amount of work on every seat:
+    # 6:5 moves slot 6's 5h:92 to 98. An entry overrides the seat tier read
+    # from the slot's stored profile (claude_swap.seats), and follows its
+    # account when the account is removed, swapped or moved
+    # (retarget_account_weights). Unlisted slots weigh what their tier says,
+    # else 1.
     account_weights: str = ""
     # How far ahead a candidate must be before `runway` moves below the
     # threshold, as a multiple of what the active account sustains. A ratio
@@ -242,7 +246,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "accountWeights", "account_weights", "string",
-            help="Relative seat capacity per slot for `runway`, e.g. 6:5",
+            help="Seat capacity per slot, e.g. 6:5; scales runway and switch limits",
         ),
         SettingSpec(
             "autoswitch", "runwayMargin", "runway_margin", "float", 1.05, 10.0,
@@ -623,6 +627,53 @@ def unset_setting(backup_root: Path, dotted_key: str) -> bool:
         del raw[spec.section]
     atomic_write_json(path, raw)
     return True
+
+
+def retarget_account_weights(
+    backup_root: Path, moves: dict[str, str | None]
+) -> str | None:
+    """Keep ``autoswitch.accountWeights`` on the accounts it was written for.
+
+    A weight describes the seat of the account in a slot, and slot numbers are
+    reused: ``add`` fills from the highest number, ``swap`` and ``move``
+    renumber. ``moves`` maps an old slot to its account's new slot, or to None
+    when the account was removed, whose entry is then dropped. Entries for
+    every other slot are kept as written, so is an unparsable one. Writes only
+    this key, like :func:`set_setting`, and removes it when nothing is left.
+
+    Returns the new value ("" when the key was removed) when the setting
+    changed, or None when it did not, in which case nothing is written.
+    """
+    path = settings_path(backup_root)
+    raw = _read_raw_for_write(path)
+    section = raw.get("autoswitch")
+    value = section.get("accountWeights") if isinstance(section, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    kept: list[str] = []
+    changed = False
+    for part in value.split(","):
+        slot, sep, weight = part.partition(":")
+        if sep and slot.strip() in moves:
+            changed = True
+            target = moves[slot.strip()]
+            if target is None:
+                continue
+            part = f"{target}:{weight.strip()}"
+        if part.strip():
+            kept.append(part.strip())
+    if not changed:
+        return None
+    new_value = ",".join(kept)
+    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+    if new_value:
+        section["accountWeights"] = new_value
+    else:
+        del section["accountWeights"]
+        if not section:
+            del raw["autoswitch"]
+    atomic_write_json(path, raw)
+    return new_value
 
 
 def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, bool]]:

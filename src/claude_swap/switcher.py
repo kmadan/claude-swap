@@ -86,7 +86,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    load_settings,
+    parse_model_names,
+    retarget_account_weights,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -1144,8 +1149,9 @@ class ClaudeAccountSwitcher:
         sequence records (including aliases, which belong to the account),
         the per-slot credential and config backups, membership in
         ``sequence`` (kept sorted, so rotation and ``cswap list`` order
-        follow the new numbers), ``activeAccountNumber``, and each slot's
-        session profile directory (history preserved). Directory mappings key on
+        follow the new numbers), ``activeAccountNumber``, each slot's
+        session profile directory (history preserved), and each slot's
+        ``autoswitch.accountWeights`` entry. Directory mappings key on
         (email, org) and are unaffected. Usage-cache rows key on the slot
         number but carry the account identity, so a swapped row fails the
         identity check and self-heals on the next poll. Auto-switch
@@ -1329,6 +1335,7 @@ class ClaudeAccountSwitcher:
         self._logger.info(
             f"Swapped slots: {num_a} ({email_a}) <-> {num_b} ({email_b})"
         )
+        self._follow_account_weights({num_a: num_b, num_b: num_a})
         return num_a, num_b
 
     def _delete_config_backup(self, account_num: str, email: str) -> None:
@@ -1623,8 +1630,8 @@ class ClaudeAccountSwitcher:
         The caller holds ``self.lock_file``. The one-way counterpart of
         :meth:`_swap_accounts_locked`: everything keyed by the slot number
         (credential and config backups, session profile, membership in
-        ``sequence`` — kept sorted — and ``activeAccountNumber``) follows the
-        account to its new number, and ``num_src`` is left empty. The caller
+        ``sequence`` — kept sorted — ``activeAccountNumber`` and its
+        ``autoswitch.accountWeights`` entry) follows the account to its new number, and ``num_src`` is left empty. The caller
         checks ``target`` is unoccupied; it is re-checked here as an
         invariant. No rollback is needed: the ``sequence.json`` write is the
         commit point — before it the old keys are untouched (strays under
@@ -1730,6 +1737,7 @@ class ClaudeAccountSwitcher:
             self._store.delete_previous_backup(target, email)
 
         self._logger.info(f"Moved slot: {num_src} ({email}) -> {target}")
+        self._follow_account_weights({num_src: target})
 
     def slot_for_directory(self, directory: str | Path) -> tuple[str | None, str | None]:
         """Resolve a directory to its mapped account slot, for `cswap run`.
@@ -4040,6 +4048,23 @@ class ClaudeAccountSwitcher:
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
 
+    def _follow_account_weights(self, moves: dict[str, str | None]) -> None:
+        """Re-key ``autoswitch.accountWeights`` after accounts change slots.
+
+        Called after the ``sequence.json`` commit point of remove, swap and
+        move, so it is best effort: a settings file that cannot be rewritten
+        is logged and leaves the slot change itself in place.
+        """
+        try:
+            new_value = retarget_account_weights(self.backup_dir, moves)
+        except Exception as e:  # never undo a committed slot change
+            self._logger.warning(f"accountWeights not updated after a slot change: {e}")
+            return
+        if new_value is not None:
+            self._logger.info(
+                f"accountWeights follows its accounts: now {new_value or '(unset)'}"
+            )
+
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
 
@@ -4125,6 +4150,9 @@ class ClaudeAccountSwitcher:
         self._write_json(self.sequence_file, data)
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
+        # A weight set for this seat must not pass to the next account that
+        # add numbers into the freed slot.
+        self._follow_account_weights({account_num: None})
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
 
