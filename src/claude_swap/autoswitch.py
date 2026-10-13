@@ -592,6 +592,13 @@ def _window_pcts(
 # account may have sat idle in between, or a burst may already be over.
 _PROJECTION_MAX_SPAN_S = 900.0
 
+# The pace a landing is sized by: every account's 5h usage over this long,
+# added up. Two readings right after a switch measure a burst instead: on
+# 2026-10-13 account 27 rose 17 points in under three minutes after the fleet
+# moved to it, 6.1 a minute against 2.4 over the hour, which set the landing
+# minimum at 61 points and kept an account with 42 out of rotation.
+FLEET_PACE_WINDOW_S = 3600.0
+
 
 def _projected_crossing(
     prev: tuple[float, dict] | None,
@@ -1027,6 +1034,10 @@ class AutoSwitchEngine:
         # waits for that evidence; see _note_activity.
         self._last_five_hour: dict[str, tuple[float, float, float | None]] = {}
         self._activity_at: float | None = None
+        # 5h usage between consecutive readings of any account, as (earlier
+        # reading's time, later reading's time, points of a 1x seat), kept for
+        # FLEET_PACE_WINDOW_S; see _fleet_pace.
+        self._usage_events: list[tuple[float, float, float]] = []
         # A TUI session override outranks the file, and must survive a reload.
         self._session_threshold: float | None = None
         # Poll plans written by the collector must key on the same threshold/
@@ -2657,10 +2668,10 @@ class AutoSwitchEngine:
         # included, because that quota is lost at the reset while every other
         # move can wait. Soonest reset first.
         expiring: list[tuple[tuple, str]] = []
-        # The least room a target must have: landing_min_minutes at the pace the
-        # active account is being worked, floored at burnRate (see
-        # _measured_pace and _room_points).
-        pace = max(self._measured_pace(current) or 0.0, settings.burn_rate)
+        # The least room a target must have: landing_min_minutes at the fleet's
+        # pace over the last hour, floored at burnRate (see _fleet_pace and
+        # _room_points).
+        pace = max(self._fleet_pace(now), settings.burn_rate)
         min_room = settings.landing_min_minutes * pace
         active_expiry_ts = (
             _five_hour_reset_ts(usage.get(current), now) or float("inf")
@@ -3328,13 +3339,15 @@ class AutoSwitchEngine:
         return TickOutcome.NO_ACTION
 
     def _note_activity(self, entries: dict, settings: AutoSwitchSettings) -> None:
-        """Record when any account's 5h usage last rose fast enough to show work.
+        """Record each account's 5h usage, and when it last rose fast enough to show work.
 
         Readings of every account count, the active one and the ones still in
         use by sessions that have not picked up a switch, because the question
-        is whether requests are being sent at all. Two readings at most 15
-        minutes apart give a rate in points of a 1x seat per minute; a window
-        that opened between them counts at the rate its first reading implies.
+        is whether requests are being sent at all. Each rise between two
+        readings of the same window, or the first reading of a window that
+        opened between them, is kept for _fleet_pace. Two readings at most 15
+        minutes apart also give a rate in points of a 1x seat per minute, which
+        is the evidence priming waits for.
         """
         for num, entry in entries.items():
             if (
@@ -3355,7 +3368,7 @@ class AutoSwitchEngine:
             if prev is None:
                 continue
             span_min = (entry.fetched_at - prev[0]) / 60.0
-            if span_min <= 0 or span_min > 15.0 or reset is None:
+            if span_min <= 0 or reset is None:
                 continue
             if prev[2] is not None and abs(prev[2] - reset) < 120.0:
                 rise = pct - prev[1]          # the same window, climbing
@@ -3365,8 +3378,13 @@ class AutoSwitchEngine:
                 rise = pct
             else:
                 continue                      # resets disagree while both run
-            rate = rise * self._weights.get(num, 1.0) / span_min
-            if rise > 0 and rate >= settings.prime_min_burn:
+            if rise <= 0:
+                continue
+            points = rise * self._weights.get(num, 1.0)
+            # Usage counts at any span, for the fleet's pace; evidence of work
+            # in progress only within 15 minutes.
+            self._usage_events.append((prev[0], entry.fetched_at, points))
+            if span_min <= 15.0 and points / span_min >= settings.prime_min_burn:
                 self._activity_at = max(self._activity_at or 0.0, entry.fetched_at)
 
     def _primes_allowed(self, now: float, settings: AutoSwitchSettings) -> bool:
@@ -3378,30 +3396,24 @@ class AutoSwitchEngine:
             and now - self._activity_at <= settings.prime_activity_minutes * 60.0
         )
 
-    def _measured_pace(self, num: str) -> float | None:
-        """The rate the account's 5h window rose over its last two readings.
+    def _fleet_pace(self, now: float) -> float:
+        """5h points of a 1x seat used per minute across every account, last hour.
 
-        In points of a 1x seat per minute, from readings of the current stint at
-        most 15 minutes apart on the same window. None when that is unknown or
-        the window did not rise.
+        Summed from the usage _note_activity records between consecutive
+        readings of each account, over FLEET_PACE_WINDOW_S before ``now``; a
+        stretch that began before that counts in proportion to the part inside
+        it. Readings far apart still count here, since the usage between them
+        happened. 0.0 until there is any, as after a restart, when the caller's
+        burnRate floor applies.
         """
-        history = self._readings.get(num) or []
-        if len(history) < 2:
-            return None
-        (t0, u0), (t1, u1) = history[-2], history[-1]
-        span_min = (t1 - t0) / 60.0
-        if span_min <= 0 or span_min > 15.0:
-            return None
-        w0, w1 = u0.get("five_hour"), u1.get("five_hour")
-        if not (isinstance(w0, dict) and isinstance(w1, dict)):
-            return None
-        p0, p1 = w0.get("pct"), w1.get("pct")
-        if not (isinstance(p0, (int, float)) and isinstance(p1, (int, float))) or p1 <= p0:
-            return None
-        r0, r1 = _parse_reset_ts(w0.get("resets_at")), _parse_reset_ts(w1.get("resets_at"))
-        if r0 is None or r1 is None or abs(r0 - r1) >= 120.0:
-            return None
-        return (p1 - p0) * self._weights.get(num, 1.0) / span_min
+        start = now - FLEET_PACE_WINDOW_S
+        self._usage_events = [e for e in self._usage_events if e[1] > start]
+        used = 0.0
+        for t0, t1, points in self._usage_events:
+            if t1 > now:
+                continue
+            used += points if t0 >= start else points * (t1 - start) / (t1 - t0)
+        return used / (FLEET_PACE_WINDOW_S / 60.0)
 
     def _note_reading(self, num: str, entry) -> None:
         """Keep the last two distinct readings of the active account.

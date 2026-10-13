@@ -8865,10 +8865,20 @@ class TestLandingRoom:
         h.clock.advance(seconds)
         return h.tick_with_usage(self._fleet(second, **override))
 
+    @staticmethod
+    def _hour_at(h, pace: float) -> None:
+        """Usage already seen over the last hour, ``pace`` points a minute in all."""
+        now = h.clock.now
+        h.engine._usage_events = [
+            (now - 3500.0 + i * 600.0, now - 3300.0 + i * 600.0, pace * 10.0)
+            for i in range(6)
+        ]
+
     def test_no_optional_move_to_an_account_that_cannot_take_the_pace(self, temp_home):
         h = self._harness(temp_home)
-        # 4% -> 26% in 4.4 minutes: about 5 points a minute, so 10 minutes is
-        # 50 points, and #19 holds 20.
+        # About 5 points a minute over the hour, so 10 minutes is 50 points,
+        # and #19 holds 20.
+        self._hour_at(h, 5.0)
         assert self._two_ticks(h, 4.0, 26.0) is TickOutcome.NO_ACTION
         assert h.active_number() == 16
 
@@ -8880,19 +8890,22 @@ class TestLandingRoom:
 
     def test_a_forced_move_lands_where_the_pace_fits(self, temp_home):
         h = self._harness(temp_home)
-        # 70% -> 93%, past its 92% limit, at about 5 points a minute.
+        # 70% -> 93%, past its 92% limit, in an hour at about 5 points a minute.
+        self._hour_at(h, 5.0)
         assert self._two_ticks(h, 70.0, 93.0) is TickOutcome.SWITCHED
         assert h.active_number() == 8
 
     def test_an_escape_from_an_exhausted_account_does_too(self, temp_home):
         h = self._harness(temp_home)
+        self._hour_at(h, 5.0)
         assert self._two_ticks(h, 75.0, 100.0) is TickOutcome.SWITCHED
         assert h.active_number() == 8
 
     def test_when_nothing_can_take_it_the_most_room_wins(self, temp_home):
         h = self._harness(temp_home)
         roomy = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 70.0, "resets_at": self._at(105)}}
-        # 40% -> 93% in two minutes: 26 points a minute needs 260 points.
+        # An hour at 26 points a minute needs 260 points, more than anyone holds.
+        self._hour_at(h, 26.0)
         assert self._two_ticks(h, 40.0, 93.0, seconds=120.0, **{"18": roomy}) is (
             TickOutcome.SWITCHED
         )
@@ -8900,8 +8913,90 @@ class TestLandingRoom:
 
     def test_zero_turns_it_off(self, temp_home):
         h = self._harness(temp_home, landing_min_minutes=0.0)
+        self._hour_at(h, 5.0)
         assert self._two_ticks(h, 4.0, 26.0) is TickOutcome.SWITCHED
         assert h.active_number() == 19
+
+    def test_a_burst_after_a_switch_does_not_raise_the_bar(self, temp_home):
+        """2026-10-13: two readings just after a switch read 6.1 a minute
+        against 2.4 for the hour. A landing is sized by the hour."""
+        h = self._harness(temp_home)
+        # 1 point a minute over the hour, then 4% -> 26% in 4.4 minutes: the
+        # hour comes to about 1.4 a minute, 14 points, and #19 holds 20.
+        self._hour_at(h, 1.0)
+        assert self._two_ticks(h, 4.0, 26.0) is TickOutcome.SWITCHED
+        assert h.active_number() == 19
+
+    def test_with_no_history_the_floor_applies(self, temp_home):
+        h = self._harness(temp_home)
+        # Just started: the burst alone is 22 points over the hour, 0.4 a
+        # minute, under the 0.8 floor, so the bar is 8 points.
+        assert self._two_ticks(h, 4.0, 26.0) is TickOutcome.SWITCHED
+        assert h.active_number() == 19
+
+
+class TestFleetPace:
+    """The last hour's 5h usage across every account, from consecutive readings."""
+
+    @pytest.fixture(autouse=True)
+    def _limits(self, monkeypatch):
+        monkeypatch.setattr(oauth, "window_thresholds", lambda: _LIVE_LIMITS)
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="runway", prime_idle_clocks=False,
+                          account_weights="19:5")
+        for num in (16, 19, 8):
+            h.seed(num, f"u{num}@example.com")
+        h.make_live("u16@example.com", 16)
+        h.engine._mutate_state(
+            lambda s: s.update({"lastSwitchAt": h.clock.now - 40.0, "lastSwitchTo": "16"})
+        )
+        self.t0 = h.clock.now
+        return h
+
+    def _fleet(self, p16, p19, p8, r16=4.0, r8=3.0) -> dict:
+        at = lambda hours: _iso_at(self.t0 + hours * 3600.0)
+        return {
+            "16": {"five_hour": {"pct": p16, "resets_at": at(r16)},
+                   "seven_day": {"pct": 20.0, "resets_at": at(90)}},
+            "19": {"five_hour": {"pct": p19, "resets_at": at(2.0)},
+                   "seven_day": {"pct": 20.0, "resets_at": at(90)}},
+            "8": {"five_hour": {"pct": p8, "resets_at": at(r8)},
+                  "seven_day": {"pct": 20.0, "resets_at": at(90)}},
+        }
+
+    def test_rises_on_every_account_add_up_with_seat_weight(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage(self._fleet(10.0, 10.0, 10.0))
+        h.clock.advance(600.0)
+        h.tick_with_usage(self._fleet(30.0, 12.0, 11.0))
+        # 20 on #16, 2 on the 5x #19 (10 points), 1 on #8: 31 points this hour.
+        assert h.engine._fleet_pace(h.clock.now) == pytest.approx(31.0 / 60.0)
+
+    def test_a_window_that_opened_between_readings_counts_from_zero(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage(self._fleet(10.0, 10.0, 50.0, r8=0.1))
+        h.clock.advance(900.0)  # #8's window reset 6 minutes ago and reopened
+        h.tick_with_usage(self._fleet(10.0, 10.0, 7.0, r8=5.1))
+        assert h.engine._fleet_pace(h.clock.now) == pytest.approx(7.0 / 60.0)
+
+    def test_usage_older_than_an_hour_drops_out_and_a_straddle_is_prorated(self, temp_home):
+        h = self._harness(temp_home)
+        now = h.clock.now
+        h.engine._usage_events = [
+            (now - 7200.0, now - 3700.0, 50.0),   # wholly before the hour
+            (now - 3900.0, now - 3300.0, 60.0),   # half inside: 30 counts
+            (now - 600.0, now - 300.0, 12.0),
+        ]
+        assert h.engine._fleet_pace(now) == pytest.approx((30.0 + 12.0) / 60.0)
+        assert len(h.engine._usage_events) == 2
+
+    def test_far_apart_readings_still_count_as_usage(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage(self._fleet(10.0, 10.0, 10.0))
+        h.clock.advance(1800.0)  # 30 minutes: too far apart for activity evidence
+        h.tick_with_usage(self._fleet(40.0, 10.0, 10.0))
+        assert h.engine._fleet_pace(h.clock.now) == pytest.approx(30.0 / 60.0)
 
 
 class TestRoomPoints:
